@@ -1,0 +1,172 @@
+"""Tests for the typed settings boundary.
+
+The suite must never depend on the developer's real ``.env`` file, so every
+test runs in an isolated temporary working directory with the relevant
+environment variables cleared first.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import pytest
+
+from telegram_documentaries.config import Settings, load_settings
+from telegram_documentaries.errors import ConfigError
+
+TOKEN_VAR = "TELEGRAM_BOT_TOKEN"
+KEY_VAR = "GEMINI_API_KEY"
+VALID_TOKEN = "test-telegram-token-value"
+VALID_KEY = "test-gemini-key-value"
+PLACEHOLDER_TOKEN = "your_telegram_bot_token_here"
+PLACEHOLDER_KEY = "your_gemini_api_key_here"
+
+
+@pytest.fixture(autouse=True)
+def isolated_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep settings tests away from the real repo ``.env`` and environment."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(TOKEN_VAR, raising=False)
+    monkeypatch.delenv(KEY_VAR, raising=False)
+
+
+def _set_valid_pair(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(TOKEN_VAR, VALID_TOKEN)
+    monkeypatch.setenv(KEY_VAR, VALID_KEY)
+
+
+def test_missing_token_raises_config_error_naming_the_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(KEY_VAR, VALID_KEY)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings()
+
+    message = str(excinfo.value)
+    assert TOKEN_VAR in message
+    assert message.count(TOKEN_VAR) == 1
+    assert "see .env.example" in message
+    assert "\n" not in message
+
+
+def test_placeholder_token_raises_config_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(TOKEN_VAR, PLACEHOLDER_TOKEN)
+    monkeypatch.setenv(KEY_VAR, VALID_KEY)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings()
+
+    message = str(excinfo.value)
+    assert TOKEN_VAR in message
+    assert "placeholder" in message.lower()
+    assert "see .env.example" in message
+    assert "\n" not in message
+
+
+def test_empty_token_raises_config_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(TOKEN_VAR, "")
+    monkeypatch.setenv(KEY_VAR, VALID_KEY)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings()
+
+    assert TOKEN_VAR in str(excinfo.value)
+
+
+def test_missing_key_raises_config_error_naming_the_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(TOKEN_VAR, VALID_TOKEN)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings()
+
+    message = str(excinfo.value)
+    assert KEY_VAR in message
+    assert message.count(KEY_VAR) == 1
+    assert "see .env.example" in message
+    assert "\n" not in message
+
+
+def test_placeholder_key_raises_config_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(TOKEN_VAR, VALID_TOKEN)
+    monkeypatch.setenv(KEY_VAR, PLACEHOLDER_KEY)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings()
+
+    message = str(excinfo.value)
+    assert KEY_VAR in message
+    assert "placeholder" in message.lower()
+    assert "see .env.example" in message
+    assert "\n" not in message
+
+
+def test_valid_pair_constructs_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_valid_pair(monkeypatch)
+
+    settings = load_settings()
+
+    assert isinstance(settings, Settings)
+    assert settings.telegram_bot_token.get_secret_value() == VALID_TOKEN
+    assert settings.gemini_api_key.get_secret_value() == VALID_KEY
+
+
+def test_settings_repr_and_str_never_reveal_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_valid_pair(monkeypatch)
+    settings = load_settings()
+
+    rendered = f"{settings!r} {settings!s}"
+
+    assert VALID_TOKEN not in rendered
+    assert VALID_KEY not in rendered
+
+
+def test_error_message_never_contains_other_configured_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(TOKEN_VAR, VALID_TOKEN)
+    monkeypatch.setenv(KEY_VAR, PLACEHOLDER_KEY)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings()
+
+    assert VALID_TOKEN not in str(excinfo.value)
+
+
+def test_multiple_problems_are_reported_in_one_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings()
+
+    message = str(excinfo.value)
+    assert TOKEN_VAR in message
+    assert KEY_VAR in message
+    assert "\n" not in message
+    assert "see .env.example" in message
+
+
+def test_load_settings_does_not_log_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _set_valid_pair(monkeypatch)
+
+    with caplog.at_level(logging.DEBUG):
+        settings = load_settings()
+
+    assert settings.telegram_bot_token.get_secret_value() == VALID_TOKEN
+    assert VALID_TOKEN not in caplog.text
+    assert VALID_KEY not in caplog.text
