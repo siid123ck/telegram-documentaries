@@ -1,0 +1,41 @@
+# Developer commit hooks. Run `pre-commit install` once per clone.
+#
+# Local hooks use `language: system` and call `uv run` so the exact, locked
+# dev environment is used. `uv` may live outside git's PATH (~/.local/bin), so
+# each entry prepends that directory. `pass_filenames: false` keeps the checks
+# whole-tree and avoids filename arguments being appended to the shell command.
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check --fix
+        entry: bash -c 'export PATH="$HOME/.local/bin:$PATH"; exec uv run ruff check --fix .'
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: ruff-format
+        name: ruff format
+        entry: bash -c 'export PATH="$HOME/.local/bin:$PATH"; exec uv run ruff format .'
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: mypy
+        name: mypy
+        entry: bash -c 'export PATH="$HOME/.local/bin:$PATH"; exec uv run mypy'
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: pytest
+        name: pytest
+        entry: bash -c 'export PATH="$HOME/.local/bin:$PATH"; exec uv run pytest'
+        language: system
+        pass_filenames: false
+        always_run: true
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
