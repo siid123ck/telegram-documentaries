@@ -12,7 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from telegram_documentaries.config import Settings, load_settings
+import telegram_documentaries.config as config_module
+from telegram_documentaries.config import MODELS, Settings, load_settings
 from telegram_documentaries.errors import ConfigError
 
 TOKEN_VAR = "TELEGRAM_BOT_TOKEN"
@@ -170,3 +171,28 @@ def test_load_settings_does_not_log_secrets(
     assert settings.telegram_bot_token.get_secret_value() == VALID_TOKEN
     assert VALID_TOKEN not in caplog.text
     assert VALID_KEY not in caplog.text
+
+
+# --- Phase 4: the converter model is defined once -----------------------------
+
+IMAGE_MODEL = "gemini-3.1-flash-image"
+
+
+def test_the_converter_model_is_the_image_model() -> None:
+    assert MODELS["converter"] == IMAGE_MODEL
+
+
+def test_the_existing_model_entries_are_unchanged() -> None:
+    assert MODELS["bouncer"] == "gemini-3.1-flash-lite"
+    assert MODELS["interviewer"] == "gemini-3.1-flash-lite"
+
+
+def test_the_image_model_id_is_written_exactly_once_in_the_source_tree() -> None:
+    package_dir = Path(config_module.__file__).parent
+
+    occurrences = sum(
+        path.read_text(encoding="utf-8").count(IMAGE_MODEL)
+        for path in package_dir.rglob("*.py")
+    )
+
+    assert occurrences == 1

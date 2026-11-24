@@ -8,16 +8,20 @@ The fakes stand in for the providers at the :class:`VisionClient` and
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 
 from telegram import Chat, Message, PhotoSize, Update
 
+from telegram_documentaries.converter_models import PNG_MAGIC
 from telegram_documentaries.interview_models import Answer, Dossier, InterviewTurn
-from telegram_documentaries.models import PhotoPayload, VisionVerdict
+from telegram_documentaries.models import ChatId, PhotoPayload, VisionVerdict
 
 #: Minimal JPEG-like payload. Tests assert it is forwarded unchanged.
 JPEG_BYTES = b"\xff\xd8\xff\xd9"
+
+#: A minimal, valid-magic PNG standing in for a generated portrait.
+PORTRAIT_BYTES = PNG_MAGIC + b"portrait-bytes"
 
 _NOW = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -208,3 +212,70 @@ class FakeInterviewClient:
         if isinstance(item, Exception):
             raise item
         return item
+
+
+class FakePortraitClient:
+    """Scripted ``PortraitClient``.
+
+    Each call pops the next scripted item: bytes are returned, an exception is
+    raised. When ``gate`` is supplied, each call waits on it first, so a test can
+    hold a generation in flight. Every call records the photo bytes it received
+    and the repair note it was given (the stage never sends one in Phase 4).
+    """
+
+    def __init__(
+        self,
+        script: Sequence[bytes | Exception] = (PORTRAIT_BYTES,),
+        *,
+        gate: asyncio.Event | None = None,
+        on_call: Callable[[], None] | None = None,
+    ) -> None:
+        self._script = list(script)
+        self._gate = gate
+        self._on_call = on_call
+        self.photos: list[bytes] = []
+        self.repair_notes: list[str | None] = []
+
+    @property
+    def calls(self) -> int:
+        """Number of times the provider was asked for a portrait."""
+        return len(self.photos)
+
+    async def render(
+        self,
+        photo_bytes: bytes,
+        dossier: Dossier,
+        /,
+        *,
+        repair_note: str | None = None,
+    ) -> bytes:
+        self.photos.append(photo_bytes)
+        self.repair_notes.append(repair_note)
+        if self._on_call is not None:
+            # Lets a test act while the model call is in flight, e.g. a /restart.
+            self._on_call()
+        if self._gate is not None:
+            await self._gate.wait()
+        if not self._script:
+            raise AssertionError("FakePortraitClient ran out of scripted replies")
+        item = self._script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+class RecordingPhotoSender:
+    """Captures every portrait the delivery step would send to Telegram.
+
+    Records the chat id, the image bytes, and the caption. When ``error`` is
+    supplied, every send raises it instead, to model a Telegram failure.
+    """
+
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self._error = error
+        self.sent: list[tuple[ChatId, bytes, str]] = []
+
+    async def __call__(self, chat_id: ChatId, image_bytes: bytes, caption: str) -> None:
+        if self._error is not None:
+            raise self._error
+        self.sent.append((chat_id, image_bytes, caption))

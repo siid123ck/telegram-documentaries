@@ -1,25 +1,34 @@
-"""Versioned, in-memory per-chat session state (schema v2).
+"""Versioned, in-memory per-chat session state (schema v3).
 
 :class:`SessionStore` is the single writer of session fields. Stages call its
-named methods (``begin_turn``, ``commit_*``, ``release_turn``, ``reset``) and
-never mutate a :class:`SessionState`, which is frozen to make that rule
-enforceable. Each commit checks the transition it performs and the invariants
+named methods (``begin_turn``, ``commit_*``, ``release_turn``, ``begin_generation``,
+``begin_delivery``, ``finish_delivery``, ``fail_delivery``, ``abandon_generation``,
+``reset``) and never mutate a :class:`SessionState`, which is frozen to make that
+rule enforceable. Each commit checks the transition it performs and the invariants
 the state must hold afterwards.
+
+Generation runs are guarded by an opaque run token. A driver method that takes a
+token changes nothing unless the token is the chat's current one, so a result that
+arrives after a reset cannot change a newer state. Each reset also advances a
+per-chat epoch, which lets the interview stages drop a late model reply.
 """
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Mapping
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from telegram_documentaries.errors import StaleResult
 from telegram_documentaries.interview_models import Answer, Dossier
 from telegram_documentaries.models import ChatId
 
 #: Bump when ``SessionState`` changes incompatibly; old states are discarded.
-#: Version 1 was the Phase 2 Bouncer state (``last_file_id``).
-STATE_VERSION = 2
+#: Version 1 was the Phase 2 Bouncer state (``last_file_id``). Version 2 had no
+#: generation run token (Phase 4 added it).
+STATE_VERSION = 3
 
 
 class StateError(RuntimeError):
@@ -30,7 +39,7 @@ class StateError(RuntimeError):
 
 
 class Phase(StrEnum):
-    """Pipeline phases. ``GENERATING`` and ``DELIVERING`` are declared only."""
+    """Pipeline phases. ``GENERATING`` and ``DELIVERING`` are driven in Phase 4."""
 
     IDLE = "idle"
     AWAITING_PHOTO = "awaiting_photo"
@@ -38,6 +47,10 @@ class Phase(StrEnum):
     DOSSIER_READY = "dossier_ready"
     GENERATING = "generating"
     DELIVERING = "delivering"
+
+
+#: Phases in which a dossier is held. It is set exactly in these phases.
+_DOSSIER_PHASES = frozenset({Phase.DOSSIER_READY, Phase.GENERATING, Phase.DELIVERING})
 
 
 class SessionState(BaseModel):
@@ -52,14 +65,19 @@ class SessionState(BaseModel):
     outstanding_question: str | None = None
     dossier: Dossier | None = None
     in_flight: bool = False
+    generation_run: str | None = None
 
 
 def _check_invariants(state: SessionState) -> None:
     """Refuse any state that breaks the cross-field rules of the phase model."""
-    if (state.dossier is not None) != (state.phase is Phase.DOSSIER_READY):
-        raise StateError("dossier is set exactly when the phase is dossier_ready")
+    if (state.dossier is not None) != (state.phase in _DOSSIER_PHASES):
+        raise StateError(
+            "dossier is set exactly in dossier_ready, generating, and delivering"
+        )
     if state.outstanding_question is not None and state.phase is not Phase.INTERVIEWING:
         raise StateError("a question is outstanding only while interviewing")
+    if (state.generation_run is not None) != (state.phase is Phase.GENERATING):
+        raise StateError("a generation run is set exactly while generating")
 
 
 class SessionStore:
@@ -67,6 +85,7 @@ class SessionStore:
 
     def __init__(self, initial: Mapping[ChatId, SessionState] | None = None) -> None:
         self._states: dict[ChatId, SessionState] = dict(initial or {})
+        self._epochs: dict[ChatId, int] = {}
 
     def get(self, chat_id: ChatId) -> SessionState:
         """Return the chat's state, restarting cleanly if it is stale or absent."""
@@ -142,9 +161,86 @@ class SessionStore:
             in_flight=False,
         )
 
+    def begin_generation(self, chat_id: ChatId) -> str | None:
+        """Start a portrait run from ``DOSSIER_READY`` and return its token.
+
+        Returns ``None`` if a run is already in flight for the chat, so a duplicate
+        update cannot start a second generation. Any other phase is a programming
+        error and raises :class:`StateError`.
+        """
+        if self.get(chat_id).in_flight:
+            return None
+        self._require_phase(chat_id, {Phase.DOSSIER_READY})
+        run = uuid.uuid4().hex
+        self._replace(
+            chat_id, phase=Phase.GENERATING, in_flight=True, generation_run=run
+        )
+        return run
+
+    def begin_delivery(self, chat_id: ChatId, run: str) -> bool:
+        """Move a finished run to ``DELIVERING``, before the photo is sent.
+
+        Returns ``False`` and changes nothing if the chat is no longer in
+        ``GENERATING`` for this ``run``, which means a reset happened while the
+        model was working. ``in_flight`` stays set during the send.
+        """
+        state = self.get(chat_id)
+        if state.phase is not Phase.GENERATING or state.generation_run != run:
+            return False
+        self._replace(chat_id, phase=Phase.DELIVERING, generation_run=None)
+        return True
+
+    def finish_delivery(self, chat_id: ChatId) -> bool:
+        """Clear ``in_flight`` once the photo is sent. The chat rests in ``DELIVERING``.
+
+        Returns ``False`` and changes nothing if the chat is not in ``DELIVERING``.
+        That happens only when a reset landed during the send (the accepted race).
+        """
+        if self.get(chat_id).phase is not Phase.DELIVERING:
+            return False
+        self._replace(chat_id, in_flight=False)
+        return True
+
+    def fail_delivery(self, chat_id: ChatId) -> bool:
+        """Roll a failed send back to ``DOSSIER_READY`` with the dossier kept.
+
+        Returns ``False`` and changes nothing if the chat is not in ``DELIVERING``.
+        """
+        if self.get(chat_id).phase is not Phase.DELIVERING:
+            return False
+        self._replace(chat_id, phase=Phase.DOSSIER_READY, in_flight=False)
+        return True
+
+    def abandon_generation(self, chat_id: ChatId, run: str) -> bool:
+        """Return a failed or dropped run to ``DOSSIER_READY``, keeping the interview.
+
+        Returns ``False`` and changes nothing if ``run`` is not the chat's current
+        generation run.
+        """
+        state = self.get(chat_id)
+        if state.phase is not Phase.GENERATING or state.generation_run != run:
+            return False
+        self._replace(
+            chat_id,
+            phase=Phase.DOSSIER_READY,
+            in_flight=False,
+            generation_run=None,
+        )
+        return True
+
+    def epoch(self, chat_id: ChatId) -> int:
+        """Return the chat's reset counter. It changes on every ``/restart``."""
+        return self._epochs.get(chat_id, 0)
+
+    def require_current(self, chat_id: ChatId, epoch: int) -> None:
+        """Raise :class:`StaleResult` if the chat was reset since ``epoch``."""
+        if self.epoch(chat_id) != epoch:
+            raise StaleResult("the chat was reset while a result was in flight")
+
     def reset(self, chat_id: ChatId) -> None:
         """Purge everything for the chat and return it to awaiting-photo."""
         self._states[chat_id] = SessionState()
+        self._epochs[chat_id] = self.epoch(chat_id) + 1
 
     def _require_phase(self, chat_id: ChatId, allowed: set[Phase]) -> None:
         if self.get(chat_id).phase not in allowed:

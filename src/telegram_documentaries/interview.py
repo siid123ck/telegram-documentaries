@@ -138,12 +138,15 @@ async def start_interview(
     phase_before = store.get(chat_id).phase
     if not store.begin_turn(chat_id):
         return Reply(ONE_AT_A_TIME_TEXT, phase_before)
+    epoch = store.epoch(chat_id)
     try:
         turn = await _request_turn(client, [], must_finish=False)
+        store.require_current(chat_id, epoch)  # drops the turn if /restart landed
         question = _ask_text(turn)
         store.commit_first_question(chat_id, photo_file_id, question)
     finally:
-        store.release_turn(chat_id)
+        if store.epoch(chat_id) == epoch:  # a reset already cleared the flag
+            store.release_turn(chat_id)
     logger.info(
         "interview_started chat_id=%s phase_before=%s phase_after=%s question_index=0",
         chat_id,
@@ -187,11 +190,13 @@ async def answer_question(
 
     if not store.begin_turn(chat_id):
         return Reply(ONE_AT_A_TIME_TEXT, Phase.INTERVIEWING)
+    epoch = store.epoch(chat_id)
     try:
         answer = Answer(question=question, answer=cleaned)
         history = [*state.answers, answer]
         must_finish = len(history) >= MAX_ANSWERS
         turn = await _request_turn(client, history, must_finish=must_finish)
+        store.require_current(chat_id, epoch)  # drops the turn if /restart landed
         # Narrow the turn before any commit, so a bad shape never leaves a
         # half-committed exchange behind.
         if turn.action == "ask":
@@ -222,7 +227,8 @@ async def answer_question(
         )
         return Reply(render_dossier(dossier), Phase.DOSSIER_READY)
     finally:
-        store.release_turn(chat_id)
+        if store.epoch(chat_id) == epoch:  # a reset already cleared the flag
+            store.release_turn(chat_id)
 
 
 @log_stage

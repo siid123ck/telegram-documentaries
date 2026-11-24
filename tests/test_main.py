@@ -211,3 +211,36 @@ def test_the_restart_command_is_routed_before_the_text_handler(
     assert isinstance(first_group[0], CommandHandler)
     assert "restart" in first_group[0].commands
     assert isinstance(first_group[1], MessageHandler)
+
+
+# --- Phase 4: concurrent update processing (D5) ---------------------------------
+
+
+def test_the_application_processes_updates_concurrently() -> None:
+    application = app_module._build_application(TEST_TOKEN, "test-key")
+
+    # PTB's default is one update at a time. A /restart or a duplicate would then
+    # wait behind a 60-second generation, so the limit must be above one.
+    assert application.update_processor.max_concurrent_updates > 1
+
+
+def test_building_the_application_does_not_import_the_adk_or_send_anything() -> None:
+    script = (
+        "import sys\n"
+        "import telegram_documentaries.app as app\n"
+        "app._build_application('123456:TEST-token-value', 'test-key')\n"
+        "leaked = [m for m in sys.modules if m.startswith('google.') "
+        "and 'adk' in m]\n"
+        "print('LEAKED=' + ','.join(leaked))\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=os.environ.copy(),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "LEAKED="

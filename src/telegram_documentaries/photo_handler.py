@@ -24,7 +24,7 @@ from pydantic import ValidationError
 from telegram import PhotoSize, Update
 
 from telegram_documentaries.bouncer import inspect as bouncer_inspect
-from telegram_documentaries.errors import VisionError
+from telegram_documentaries.errors import StaleResult, VisionError
 from telegram_documentaries.gateway import ReplySender, send_reply
 from telegram_documentaries.interview import start_interview
 from telegram_documentaries.interview_client import InterviewClient
@@ -168,6 +168,10 @@ class PhotoGate:
                 await self._process(update, ref)
             finally:
                 self._in_flight.discard(ref.chat_id)
+        except StaleResult:
+            # A /restart reset the chat while the photo was being checked. The reset
+            # has already replied, so the late result is dropped without a reply.
+            logger.info("photo_result_dropped reason=stale_run chat_id=%s", ref.chat_id)
         except Exception as exc:  # one bad update must never stop the poller
             logger.error(
                 "photo_handler_error error_type=%s chat_id=%s",
@@ -214,8 +218,10 @@ class PhotoGate:
                 await self._nudge(update, ref, EMPTY_PHOTO_TEXT, "malformed")
             return
 
+        epoch = self._store.epoch(ref.chat_id)
         try:
             verdict = await bouncer_inspect(photo, self._client)
+            self._store.require_current(ref.chat_id, epoch)  # /restart may have landed
             if not verdict.contains_human:
                 text = REJECTION_TEMPLATE.format(
                     subject=render_subject(verdict.detected_subject)
@@ -228,6 +234,8 @@ class PhotoGate:
             )
         except VisionError:
             # The failing stage already logged the typed error; state is untouched.
+            if self._store.epoch(ref.chat_id) != epoch:
+                return  # a /restart already replied; this failure is stale
             await self._nudge(update, ref, RESEND_TEXT, "vision_error")
             return
 

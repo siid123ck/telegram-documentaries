@@ -10,11 +10,15 @@
   No ad-hoc `pip install` in docs or CI.
 - **Telegram transport:** `python-telegram-bot` v21+ (async), long polling via
   `getUpdates`. No webhooks, no inbound HTTP server, no public URL.
-- **Agents:** Google Agent Development Kit (ADK), hub-and-spoke.
+- **Agents:** Google Agent Development Kit (ADK), hub-and-spoke. The Converter is
+  the exception: it calls `google.genai` directly, with one image request, because
+  the ADK path could not be tested offline (see the spike note in
+  `converter_client.py`). No dependency was added for this.
 - **Models:**
   - Bouncer — `gemini-3.1-flash-lite` (vision).
   - Interviewer / orchestrator — `gemini-3.1-flash-lite`.
-  - Converter — `gemini-3.1-flash-image` (native multimodal image output).
+  - Converter — `gemini-3.1-flash-image` (native multimodal image output; called
+    through `google.genai`, `response_modalities=["IMAGE"]`).
   - Scripter — `gemini-3.1-flash-lite`.
   - Narrator — `gemini-3.1-flash-tts-preview` (TTS, **not** an agent).
 - **Audio:** OGG/Opus, delivered with `sendVoice` as a Telegram voice note.
@@ -45,6 +49,11 @@ Telegram update
 Each stage is its own module with a narrow interface. The orchestrator contains
 routing and state, not prompt text or HTTP details.
 
+Provider SDK imports are confined to the model-client modules (D14, Phase 4):
+`vision_client.py` and `interview_client.py` import the ADK, and
+`converter_client.py` imports `google.genai`. No stage, router, or test imports a
+provider SDK. Tests use fakes at the seam.
+
 ## State machine
 
 Explicit phases, no booleans-as-state:
@@ -52,9 +61,24 @@ Explicit phases, no booleans-as-state:
 `IDLE` → `AWAITING_PHOTO` → `INTERVIEWING` → `DOSSIER_READY` (confirmed 2026-11-24)
 → `GENERATING` → `DELIVERING` → `IDLE`
 
-Driven today: `AWAITING_PHOTO`, `INTERVIEWING`, `DOSSIER_READY`. `GENERATING` and
-`DELIVERING` are declared but have no transitions yet (Phases 4–6). Phase 4 adds
-`DOSSIER_READY → GENERATING`.
+Driven today: `AWAITING_PHOTO`, `INTERVIEWING`, `DOSSIER_READY`, `GENERATING`, and
+`DELIVERING`. `IDLE` is declared but not driven.
+
+Portrait transitions (Phase 4, confirmed 2026-11-24):
+
+- `DOSSIER_READY → GENERATING`: `begin_generation` starts a run and sets a new run
+  token. The dossier text is sent first.
+- `GENERATING → DELIVERING`: `begin_delivery`, checked before the photo is sent. The
+  token is cleared. A reset during generation makes this return `False`, and nothing
+  is sent.
+- `DELIVERING → DOSSIER_READY`: `fail_delivery`, when `send_photo` raises. The dossier
+  is kept, and the apology is sent.
+- `GENERATING → DOSSIER_READY`: `abandon_generation`, on any generation failure (the
+  answers and dossier are kept). Also in the `finally` block of the run, so the chat is
+  never left in `GENERATING`.
+- Any phase → `AWAITING_PHOTO`: `/restart`, which resets at once and abandons any run.
+- `DELIVERING` is the resting phase until Phase 5 (D1). Text and photos there get the
+  "already done" nudge.
 
 Interview rules (confirmed 2026-11-24):
 
@@ -73,7 +97,16 @@ Interview rules (confirmed 2026-11-24):
 - Transitions are centralised in the state driver; stages must not mutate session
   fields directly.
 - `GENERATING`/`DELIVERING` must be safe against a duplicate update arriving
-  while work is in flight for the same `chat_id`.
+  while work is in flight for the same `chat_id`. A duplicate text or photo gets the
+  one-at-a-time nudge and starts no second generation (`begin_generation` refuses it).
+- **`/restart` bypasses the in-flight guard** in every phase, including `GENERATING`
+  (MISSION: "mid-generation"). Any model result that lands after the reset is dropped
+  without a send, using the run token or the chat's reset epoch, and logged at `info`.
+- **Concurrent update processing** is enabled on the PTB application
+  (`concurrent_updates(True)`, Phase 4 D5). PTB's default serialises updates, which
+  would hold a `/restart` or duplicate behind a 60-second generation. This also
+  changes the Phase 2 and Phase 3 handlers, which now run concurrently. The in-flight
+  guards in those handlers cover the effect.
 
 ## Session state
 
@@ -82,8 +115,14 @@ Interview rules (confirmed 2026-11-24):
   the chat restarts cleanly.
 - One shared state driver is the only writer. Access from stages goes through it.
 - Reset (`/start`, `/restart`, or any recovery) purges: dossier, interview
-  progress, suggested animal, photo reference, temporary media, and derived
-  output. Reset never restarts the process and never touches other chats.
+  progress, suggested animal, photo reference, the generation run token, and
+  derived output. Reset never restarts the process and never touches other chats.
+  Portrait bytes are never stored in the session: they are held in memory only for
+  the send. The original photo is re-downloaded by `file_id` at generation time, so
+  the session holds a reference only.
+- Schema version **3** (Phase 4): adds `generation_run: str | None`, a `uuid4` hex
+  token set exactly in `GENERATING`. The `dossier` invariant covers `DOSSIER_READY`,
+  `GENERATING`, and `DELIVERING`. A stored version 2 is discarded on read.
 - Every user-visible outbound message must be derivable from the session; nothing
   may be assumed from a previously sent message that is not stored.
 
@@ -131,6 +170,9 @@ Interview rules (confirmed 2026-11-24):
   `@timed`, `@retry`) over sprinkling log calls through business logic.
 - Every stage boundary logs: entry, outcome, duration, and error type. Never log
   tokens, keys, raw image bytes, or full user answers.
+- A generation run logs one outcome line. `outcome=ok` on success, or
+  `outcome=error error_type=<type>` at `error` on failure. A stale run logs
+  `stage_dropped` at `info` with no bytes. The provider message is never logged.
 - **Fail loudly and log** for non-critical, user-invisible work (cleanup,
   metrics, temp-file removal).
 - **On the user's validated conversation path:** catch, log loudly at error
@@ -145,6 +187,13 @@ Interview rules (confirmed 2026-11-24):
 - Every provider call has an explicit timeout.
 - Retries are bounded (max 2) with backoff, and only for retryable classes
   (timeout, 429, 5xx). Non-retryable errors fail fast.
+- **Converter (Phase 4, confirmed 2026-11-24):** 60 s per attempt
+  (`REQUEST_TIMEOUT_SECONDS`), max 2 attempts, with the same retry classes. A 400,
+  401, 403, or 404 is attempted once. The reply must be a PNG or JPEG image, checked
+  by its magic bytes, at most 10 MiB. A non-image reply fails the run at once with no
+  repair call, because a second paid call cannot fix a missing image. The **paid-call
+  guard** checks the run token before every model call, including the retry, so a
+  `/restart` stops any further paid call.
 - Degradation policy: Bouncer unavailable → ask the user to resend the photo;
   Converter failure → apologise and offer `/restart`; TTS failure → deliver the
   script as text so the run is not lost; Scripter failure → retry once, then
@@ -172,8 +221,9 @@ Interview rules (confirmed 2026-11-24):
   values and is kept in sync.
 - `uv.lock` is committed. `uv sync` reproduces the environment.
 - No secrets, tokens, chat IDs, or generated media in the repository.
-- Generated/temporary audio and image files are written outside the repo tree
-  (temp dir) and deleted after send.
+- The Converter writes no files. The portrait is sent from memory through a
+  `BytesIO`, so there is no temp file to delete. Phase 6 audio still follows the rule
+  above: temp dir, deleted after send.
 
 ## README policy
 
@@ -195,6 +245,6 @@ behaviour. It must always document:
 | Phase + routing + reset | orchestrator/state driver | contain prompt text or HTTP details |
 | Human detection | Bouncer | mutate session state |
 | Questioning + dossier | Interviewer | send Telegram messages directly (returns content) |
-| Image fusion | Converter | write files to the repo tree |
+| Image fusion | Converter | write files to the repo tree, or import the ADK (its call goes through `google.genai`) |
 | Narration text | Scripter | call TTS |
 | Speech synthesis | Narrator tool | be modelled as an autonomous agent |

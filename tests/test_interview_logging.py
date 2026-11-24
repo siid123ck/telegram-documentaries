@@ -14,7 +14,9 @@ import logging
 import pytest
 from fakes import (
     FakeInterviewClient,
+    FakePortraitClient,
     FakeVisionClient,
+    RecordingPhotoSender,
     RecordingSender,
     ask,
     finish,
@@ -65,6 +67,8 @@ def _router(
         interview=interview,
         store=store,
         download=download,
+        portraits=FakePortraitClient(),
+        send_photo=RecordingPhotoSender(),
         reply=sender,
     )
     return router, sender, store

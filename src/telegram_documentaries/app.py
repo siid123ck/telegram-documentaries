@@ -25,7 +25,9 @@ from telegram.ext import (
 
 from telegram_documentaries import __version__
 from telegram_documentaries.config import describe_config_source, load_settings
+from telegram_documentaries.converter_client import AdkPortraitClient
 from telegram_documentaries.errors import ConfigError
+from telegram_documentaries.generation import telegram_photo_sender
 from telegram_documentaries.interview_client import AdkInterviewClient
 from telegram_documentaries.logging_setup import configure_logging
 from telegram_documentaries.photo_handler import telegram_downloader
@@ -65,12 +67,16 @@ def _build_application(token: str, gemini_api_key: str) -> TelegramApplication:
     constructed lazily, so building the application never imports the ADK or
     contacts the network.
     """
-    application = Application.builder().token(token).build()
+    # Concurrent updates: a /restart or a duplicate must be handled while a
+    # generation is awaiting the model. PTB's default serialises updates.
+    application = Application.builder().token(token).concurrent_updates(True).build()
     router = UpdateRouter(
         vision=AdkVisionClient(api_key=gemini_api_key),
         interview=AdkInterviewClient(api_key=gemini_api_key),
         store=SessionStore(),
         download=telegram_downloader(application.bot),
+        portraits=AdkPortraitClient(api_key=gemini_api_key),
+        send_photo=telegram_photo_sender(application.bot),
     )
     restart_cb = _update_callback(router.handle_restart)
     text_cb = _update_callback(router.handle_text)
