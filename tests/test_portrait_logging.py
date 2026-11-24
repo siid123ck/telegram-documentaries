@@ -453,6 +453,8 @@ _FORBIDDEN_LOG_ATTRIBUTES = frozenset(
 _SAFE_EXCEPTION_CALLS = frozenset({"type", "_http_status"})
 _FORBIDDEN_CALLS = frozenset({"open"})
 _FORBIDDEN_IMPORTS = frozenset({"tempfile"})
+#: The only source module allowed to import ``tempfile`` (its temp-file staging).
+_TEMPFILE_EXEMPT_FILES = frozenset({"narrator_sender.py"})
 _FORBIDDEN_ATTRIBUTE_CALLS = frozenset({"write_bytes", "write_text"})
 
 
@@ -525,7 +527,10 @@ def _sweep_source(path: Path) -> list[str]:
                 if isinstance(node, ast.Import)
                 else [node.module or ""]
             )
-            if any(name.split(".")[0] in _FORBIDDEN_IMPORTS for name in names):
+            if (
+                any(name.split(".")[0] in _FORBIDDEN_IMPORTS for name in names)
+                and where not in _TEMPFILE_EXEMPT_FILES
+            ):
                 findings.append(f"{where}:{node.lineno} imports a temp-file module")
         elif isinstance(node, ast.Call):
             func = node.func
@@ -553,6 +558,8 @@ def test_the_source_has_no_bare_excepts_silent_catches_or_media_file_io() -> Non
         findings.extend(_sweep_source(path))
 
     assert findings == []
+    # The tempfile exemption covers exactly one module, so nothing else can slip past.
+    assert frozenset({"narrator_sender.py"}) == _TEMPFILE_EXEMPT_FILES
 
 
 def test_the_sweep_itself_catches_each_forbidden_construct(tmp_path: Path) -> None:

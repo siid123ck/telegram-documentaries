@@ -4,7 +4,8 @@ A Telegram bot that, eventually, turns a user's portrait photo into a comedy
 wildlife documentary *about them*: a hybrid animal portrait plus a short,
 hushed, Attenborough-style voice note narrating "this magnificent specimen".
 
-**Current status: Phase 4 — Converter (hybrid portrait), offline-verified.**
+**Current status: Phase 6 — Narrator (voice note), offline-verified; live Telegram and
+Gemini checks deferred.**
 Once a photo passes the Bouncer, the bot interviews the subject, then turns the
 dossier and the original photo into one hybrid animal portrait. While the bot is
 waiting for a photo, every text message still gets the fixed reply `hey mate!`. A
@@ -38,8 +39,8 @@ human is in the picture:
   so resending is safe.
 - When the interview finishes, the bot sends the **dossier as one text message**:
   three to seven quirks (topic and observation), then one suggested animal and a
-  short reason. Nothing else is shown. The image, narration, and voice note come in
-  later phases.
+  short reason. Nothing else is shown. The portrait, the script text, and the
+  voice note follow (see below).
 - **`/restart`** works in any phase, including while the portrait is being
   generated. It discards the photo, the answers, the question, the dossier, and any
   portrait still in progress, and the bot replies with the opening prompt at once.
@@ -71,10 +72,37 @@ human is in the picture:
 - The chat is in the **`GENERATING`** phase while the portrait is being made. Once
   the model's image has been checked and is handed to Telegram, the chat moves to
   **`DELIVERING`**.
-- After the portrait is sent, the chat **rests** in `DELIVERING`. Text and photos
-  then get the *"Your dossier is complete"* nudge, and `/restart` starts a new
-  subject. The Scripter and voice note come in a later phase, so nothing else
-  happens after the portrait until `/restart`.
+- After the portrait is sent, the bot sends the **script text** (step 2, see below)
+  and then the **voice note** (step 3). The chat then **rests** in `DELIVERING`. Text
+  and photos get the *"Your dossier is complete"* nudge, or *"One at a time, please"*
+  while narration is running, and `/restart` starts a new subject.
+
+### The script and the voice note
+
+- **Step 2, script text.** The Scripter writes one paragraph (about 60 to 90 words)
+  from the dossier and sends it as plain text. The script is kept for the chat. If the
+  Scripter fails, the bot sends a short apology that names `/restart`, and the
+  portrait stands.
+- **Step 3, voice note.** The Narrator reads the script with Gemini TTS, in a deep,
+  posh British, Attenborough-style voice, and sends it as one **MP3** Telegram voice
+  note (`sendVoice`, no caption). The MP3 is an intentional change from the roadmap's
+  OGG/Opus: Telegram accepts MP3 for voice notes. The voice name is set in
+  `config.py`; the Tech Lead picks the final voice after a live audition.
+- **Order.** Portrait, then script text, then voice note. The script text is never
+  removed, so the run is not lost if narration fails.
+- **One synthesis per run.** A run makes at most **two** TTS attempts. A second
+  attempt happens only after a timeout, a rate limit, or a server error, with a 30 s
+  limit per attempt. A duplicate message during narration starts no second synthesis
+  and sends no second voice note.
+- **Narration unavailable.** If synthesis, encoding, or the voice send fails, the bot
+  sends one short note: *"Narration is unavailable for this run. Your portrait and
+  script stand; send /restart for a new subject."* It carries no error detail.
+- **Temp file.** The MP3 is written to the system temp directory (never inside the
+  repo), sent by path, and deleted after the send, whether the send succeeds or fails.
+  A failed deletion is logged at `error` and does not stop the run.
+- **`/restart` during narration** resets the chat at once. A synthesis or voice note
+  that finishes after the reset is dropped without a message. A voice send already in
+  flight when `/restart` arrives may still be delivered; this race is accepted.
 
 Other messages (voice notes, stickers, edits, channel posts) are ignored without
 crashing the process. Live Telegram and Gemini verification is **deferred** until
@@ -90,17 +118,17 @@ Telegram update -> transport adapter -> orchestrator (state machine)
                                            -> Interviewer  (questions + dossier)
                                            -> Converter    (hybrid portrait)
                                            -> Scripter     (narration text)
-                                           -> Narrator     (TTS voice note)
+                                           -> Narrator     (TTS voice note, MP3)
                                         -> Telegram send
 ```
 
-So far the **gateway**, the **Bouncer**, the **Interviewer**, and the **Converter**
-exist. The Bouncer and the Interviewer are Google ADK agents behind a small seam
+So far the **gateway**, the **Bouncer**, the **Interviewer**, the **Converter**, the
+**Scripter**, and the **Narrator** exist. The Bouncer and the Interviewer are Google ADK agents behind a small seam
 each. The Converter calls the image model through its own seam. The orchestrator
 owns the chat's phases `AWAITING_PHOTO → INTERVIEWING → DOSSIER_READY → GENERATING
-→ DELIVERING` in a versioned, in-memory session keyed by chat. The Scripter and
-Narrator are deliberately deferred to later phases (see
-[Not supported / deliberately deferred](#not-supported--deliberately-deferred)).
+→ DELIVERING` in a versioned, in-memory session keyed by chat. The Narrator is a
+direct TTS call (a tool, not an agent) and runs inside `DELIVERING`; no new phase is
+added. See [Not supported / deliberately deferred](#not-supported--deliberately-deferred).
 
 ## Prerequisites
 
@@ -202,7 +230,10 @@ src/telegram_documentaries/   package (config, errors, logging, gateway, app, en
                               models, state, bouncer, vision_client, prompts,
                               photo_handler, messages, interview_models,
                               interview_client, interview, converter_models,
-                              converter_client, converter, generation, routing)
+                              converter_client, converter, scripter_models,
+                              scripter_client, scripter, narrator_models,
+                              narrator_audio, narrator_client, narrator_sender,
+                              narrator, generation, routing)
 tests/                        offline unit tests
 scripts/test, scripts/hooks   ground-truth dev scripts
 .env.example                  documented config contract (placeholders)
@@ -216,8 +247,10 @@ These are **out of scope** and will not work yet; they need a later spec:
 - **Webhooks, public URLs, inbound HTTP servers** — transport is long polling only.
 - **Persistence / restart survival** — session state is in memory only; a restart
   clears every chat's photo state.
-- **The rest of the pipeline (Phases 5–7)** — no Scripter, Narrator/TTS, or voice
-  notes. After the portrait is sent, the chat rests in `DELIVERING` until `/restart`.
+- **Phase 7 (`/start` behaviour and wrong-payload guards)** — `/start` is not yet
+  authored. After narration, the chat rests in `DELIVERING` until `/restart`.
+- **Voice choice and other languages** — one voice is set in `config.py`; there is no
+  voice selection, multiple voices, or video.
 - **Editing or regenerating the portrait** — there is no second image and no
   "try another" command. A failed run is retried only by `/restart` and a new
   interview.

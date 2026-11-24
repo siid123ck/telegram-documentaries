@@ -21,7 +21,9 @@
     through `google.genai`, `response_modalities=["IMAGE"]`).
   - Scripter — `gemini-3.1-flash-lite`.
   - Narrator — `gemini-3.1-flash-tts-preview` (TTS, **not** an agent).
-- **Audio:** OGG/Opus, delivered with `sendVoice` as a Telegram voice note.
+- **Audio:** MP3, delivered with `sendVoice` as a Telegram voice note. The TTS reply is
+  raw PCM, encoded locally with `lameenc` (the one Phase 6 dependency). The roadmap said
+  OGG/Opus; MP3 is a recorded deviation (Telegram accepts MP3 for voice notes).
 - **Validation:** Pydantic v2.
 - **Tests:** `pytest` (+ `pytest-asyncio`), no real network.
 
@@ -42,7 +44,7 @@ Telegram update
         -> Interviewer  (question, dossier, suggested animal)
         -> Converter    (portrait bytes)
         -> Scripter     (narration text)
-        -> Narrator     (ogg bytes via TTS tool)
+        -> Narrator     (mp3 bytes via TTS tool)
    -> Telegram send
 ```
 
@@ -194,10 +196,17 @@ Interview rules (confirmed 2026-11-24):
   repair call, because a second paid call cannot fix a missing image. The **paid-call
   guard** checks the run token before every model call, including the retry, so a
   `/restart` stops any further paid call.
+- **Narrator (Phase 6, offline-verified; live values unconfirmed):** 30 s per
+  attempt (`NARRATION_TIMEOUT_SECONDS`), max 2 synthesis attempts per run, retried only
+  for timeout, 429, and 5xx. A 400, 401, 403, or 404 is attempted once, and so is a
+  malformed or empty reply, which the Narrator checks into a typed `TtsReply` (MIME
+  type, sample rate, size cap). The MP3 is checked into `VoiceNote` before it is sent.
+  At most one synthesis and one voice note per run. The `/restart` epoch guard covers
+  every paid call and every send.
 - Degradation policy: Bouncer unavailable → ask the user to resend the photo;
   Converter failure → apologise and offer `/restart`; TTS failure → deliver the
-  script as text so the run is not lost; Scripter failure → retry once, then
-  deliver the portrait with a short apology.
+  script as text so the run is not lost, and send one narration-unavailable note;
+  Scripter failure → retry once, then deliver the portrait with a short apology.
 - No unbounded queues, no fire-and-forget tasks without error capture.
 
 ## Testing

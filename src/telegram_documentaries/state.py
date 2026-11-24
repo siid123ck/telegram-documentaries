@@ -1,9 +1,10 @@
-"""Versioned, in-memory per-chat session state (schema v4).
+"""Versioned, in-memory per-chat session state (schema v5).
 
 :class:`SessionStore` is the single writer of session fields. Stages call its
 named methods (``begin_turn``, ``commit_*``, ``release_turn``, ``begin_generation``,
 ``begin_delivery``, ``finish_delivery``, ``fail_delivery``, ``abandon_generation``,
-``begin_script``, ``commit_script``, ``abandon_script``, ``reset``) and never
+``begin_script``, ``commit_script``, ``abandon_script``, ``begin_narration``,
+``end_narration``, ``reset``) and never
 mutate a :class:`SessionState`, which is frozen to make that rule enforceable.
 Each commit checks the transition it performs and the invariants the state must
 hold afterwards.
@@ -13,7 +14,8 @@ token changes nothing unless the token is the chat's current one, so a result th
 arrives after a reset cannot change a newer state. Each reset also advances a
 per-chat epoch, which lets the interview stages drop a late model reply. The script
 step has no run token (``begin_delivery`` clears it), so its driver methods are
-guarded by the epoch alone.
+guarded by the epoch alone. The narration step is guarded the same way, and its
+``narration_started`` flag makes a second synthesis in one run impossible.
 """
 
 from __future__ import annotations
@@ -31,8 +33,8 @@ from telegram_documentaries.models import ChatId
 #: Bump when ``SessionState`` changes incompatibly; old states are discarded.
 #: Version 1 was the Phase 2 Bouncer state (``last_file_id``). Version 2 had no
 #: generation run token (Phase 4 added it). Version 3 had no stored script (Phase 5
-#: added it).
-STATE_VERSION = 4
+#: added it). Version 4 had no narration flag (Phase 6 added it).
+STATE_VERSION = 5
 
 
 class StateError(RuntimeError):
@@ -71,6 +73,7 @@ class SessionState(BaseModel):
     in_flight: bool = False
     generation_run: str | None = None
     script: str | None = None
+    narration_started: bool = False
 
 
 def _check_invariants(state: SessionState) -> None:
@@ -85,6 +88,10 @@ def _check_invariants(state: SessionState) -> None:
         raise StateError("a generation run is set exactly while generating")
     if state.script is not None and state.phase is not Phase.DELIVERING:
         raise StateError("a script is set only while delivering")
+    if state.narration_started and (
+        state.phase is not Phase.DELIVERING or state.script is None
+    ):
+        raise StateError("narration has started only while delivering with a script")
 
 
 class SessionStore:
@@ -279,6 +286,37 @@ class SessionStore:
             self.epoch(chat_id) != epoch
             or self.get(chat_id).phase is not Phase.DELIVERING
         ):
+            return False
+        self._replace(chat_id, in_flight=False)
+        return True
+
+    def begin_narration(self, chat_id: ChatId, epoch: int) -> bool:
+        """Start the one narration run for this delivery (N10).
+
+        Sets ``narration_started`` and ``in_flight`` together. Returns ``False`` and
+        changes nothing if the chat was reset since ``epoch``, is not in ``DELIVERING``
+        with a script, has a turn in flight, or has already started narration. The
+        flag is cleared only by :meth:`reset`, so a failed run is never retried.
+        """
+        state = self.get(chat_id)
+        if (
+            self.epoch(chat_id) != epoch
+            or state.phase is not Phase.DELIVERING
+            or state.script is None
+            or state.in_flight
+            or state.narration_started
+        ):
+            return False
+        self._replace(chat_id, narration_started=True, in_flight=True)
+        return True
+
+    def end_narration(self, chat_id: ChatId, epoch: int) -> bool:
+        """Clear ``in_flight`` when the narration run ends (N11).
+
+        ``narration_started`` stays set. Returns ``False`` and changes nothing if the
+        chat was reset since ``epoch``.
+        """
+        if self.epoch(chat_id) != epoch:
             return False
         self._replace(chat_id, in_flight=False)
         return True

@@ -21,6 +21,7 @@ from telegram_documentaries.messages import (
     EMPTY_ANSWER_TEXT,
     GENERATION_FAILED_TEXT,
     HEY_MATE,
+    NARRATION_UNAVAILABLE_TEXT,
     NO_QUESTION_TEXT,
     ONE_AT_A_TIME_TEXT,
     OPENING_PROMPT,
@@ -346,6 +347,81 @@ def test_the_script_step_reuses_existing_copy_without_redefining_it(
 
     occurrences = sum(
         path.read_text(encoding="utf-8").count(text)
+        for path in package_dir.rglob("*.py")
+    )
+
+    assert occurrences == 1
+
+
+# --- Phase 6: narration failure copy ------------------------------------------
+
+_NARRATION_FAILURE_FORBIDDEN = (
+    "traceback",
+    "stack",
+    'file "',
+    "error",
+    "exception",
+    "timeout",
+    "timed out",
+    "rate",
+    "provider",
+    "gemini",
+    "tts",
+    "model",
+    "validation",
+    "invalid",
+    "http",
+    "429",
+    "500",
+    "503",
+    "{",
+    "}",
+)
+
+
+def test_the_narration_failure_text_is_non_empty() -> None:
+    assert NARRATION_UNAVAILABLE_TEXT.strip()
+
+
+def test_the_narration_failure_text_says_narration_is_unavailable() -> None:
+    assert "narration is unavailable" in NARRATION_UNAVAILABLE_TEXT.lower()
+
+
+def test_the_narration_failure_text_says_the_portrait_and_script_stand() -> None:
+    lowered = NARRATION_UNAVAILABLE_TEXT.lower()
+
+    assert "portrait" in lowered
+    assert "script" in lowered
+    assert "stand" in lowered
+
+
+def test_the_narration_failure_text_names_restart() -> None:
+    assert "/restart" in NARRATION_UNAVAILABLE_TEXT
+
+
+def test_the_narration_failure_text_is_short() -> None:
+    assert len(NARRATION_UNAVAILABLE_TEXT) <= 160
+
+
+def test_the_narration_failure_text_is_one_plain_line() -> None:
+    assert "\n" not in NARRATION_UNAVAILABLE_TEXT
+
+
+@pytest.mark.parametrize("forbidden", _NARRATION_FAILURE_FORBIDDEN)
+def test_the_narration_failure_text_names_no_provider_detail_or_trace(
+    forbidden: str,
+) -> None:
+    assert forbidden not in NARRATION_UNAVAILABLE_TEXT.lower()
+
+
+def test_the_narration_failure_literal_is_written_once_in_the_package() -> None:
+    # The source literal is split across two lines, so the distinctive first
+    # sentence is counted instead of the whole constant.
+    package_dir = Path(messages.__file__).parent
+    fragment = "Narration is unavailable for this run."
+
+    occurrences = sum(
+        path.read_text(encoding="utf-8").count(fragment)
         for path in package_dir.rglob("*.py")
     )
 

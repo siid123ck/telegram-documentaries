@@ -211,3 +211,40 @@ def test_the_flash_lite_model_id_is_written_once_in_config_module() -> None:
     config_source = Path(config_module.__file__).read_text(encoding="utf-8")
 
     assert config_source.count(FLASH_LITE_MODEL) == 1
+
+
+# --- Phase 6: the narrator model and voice are defined once -------------------
+
+TTS_MODEL = "gemini-3.1-flash-tts-preview"
+
+
+def test_the_narrator_model_is_the_tts_model() -> None:
+    assert MODELS["narrator"] == TTS_MODEL
+
+
+def test_the_bouncer_interviewer_and_scripter_entries_are_unchanged_by_phase_six() -> (
+    None
+):
+    assert MODELS["bouncer"] == FLASH_LITE_MODEL
+    assert MODELS["interviewer"] == FLASH_LITE_MODEL
+    assert MODELS["scripter"] == FLASH_LITE_MODEL
+    assert MODELS["converter"] == IMAGE_MODEL
+
+
+def test_the_narrator_voice_is_a_non_empty_string_in_config() -> None:
+    # getattr: the name does not exist yet, so mypy must not fail before pytest runs.
+    voice = getattr(config_module, "NARRATOR_VOICE")  # noqa: B009
+
+    assert isinstance(voice, str)
+    assert voice.strip()
+
+
+def test_the_tts_model_id_is_written_exactly_once_in_the_source_tree() -> None:
+    package_dir = Path(config_module.__file__).parent
+
+    occurrences = sum(
+        path.read_text(encoding="utf-8").count(TTS_MODEL)
+        for path in package_dir.rglob("*.py")
+    )
+
+    assert occurrences == 1
