@@ -84,6 +84,13 @@ GENERATION_FAILED_TEXT = (
     "Sorry — the portrait studio jammed on that one. Send /restart to try again."
 )
 
+#: Sent when the script step fails. It says the portrait stands and points to
+#: ``/restart``. It carries no code, error type, provider wording, or script text.
+SCRIPT_FAILED_TEXT = (
+    "The narration crew has wandered off. Your portrait stands; "
+    "send /restart for a new subject."
+)
+
 #: Second caption line. Fixed copy, not per-animal and never model prose (D16).
 CAPTION_SECOND_LINE = "Filmed in its natural habitat, unaware it is being watched."
 

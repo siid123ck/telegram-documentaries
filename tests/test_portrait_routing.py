@@ -19,6 +19,7 @@ from fakes import (
     FakeDownloader,
     FakeInterviewClient,
     FakePortraitClient,
+    FakeScriptClient,
     FakeVisionClient,
     RecordingPhotoSender,
     ask,
@@ -75,6 +76,7 @@ def _harness(
     vision_gate: asyncio.Event | None = None,
     portraits: FakePortraitClient | None = None,
     photos: RecordingPhotoSender | None = None,
+    scripts: FakeScriptClient | None = None,
 ) -> _Harness:
     harness: _Harness
 
@@ -96,6 +98,10 @@ def _harness(
         await photo_sender(chat_id, image_bytes, caption)
         harness.log.append(f"<portrait chat={int(chat_id)}>")
 
+    async def send_text(chat_id: ChatId, text: str) -> None:
+        harness.log.append(f"<script chat={int(chat_id)}>")
+        harness.log.append(text)
+
     router = UpdateRouter(
         vision=vision,
         interview=interview,
@@ -104,6 +110,8 @@ def _harness(
         portraits=portrait_client,
         send_photo=send_photo,
         reply=reply,
+        scripts=scripts,
+        send_text=send_text,
     )
     harness = _Harness(
         router=router,
@@ -152,6 +160,24 @@ async def _wait_until_called(portraits: FakePortraitClient) -> None:
 
 
 # --- The happy path through the router ----------------------------------------
+
+_SCRIPT = " ".join(f"word{index}" for index in range(75))
+
+
+async def test_the_script_is_sent_after_the_portrait_through_the_router() -> None:
+    # The real router wiring: the script step must be reachable from handle_text.
+    scripts = FakeScriptClient([_SCRIPT])
+    h = _harness(scripts=scripts)
+
+    await _answer_all(h)
+
+    assert scripts.calls == 1
+    assert h.log[-3:] == [
+        f"<portrait chat={int(_CHAT)}>",
+        f"<script chat={int(_CHAT)}>",
+        _SCRIPT,
+    ]
+    assert h.store.get(_CHAT).phase is Phase.DELIVERING
 
 
 async def test_the_dossier_text_is_sent_before_the_portrait() -> None:

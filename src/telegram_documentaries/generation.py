@@ -22,14 +22,18 @@ from typing import Protocol, TypeAlias
 from telegram_documentaries.converter import generate_portrait
 from telegram_documentaries.converter_client import PortraitClient
 from telegram_documentaries.errors import StaleResult, VisionError
+from telegram_documentaries.interview_models import Dossier
 from telegram_documentaries.logging_setup import log_stage
 from telegram_documentaries.messages import (
     GENERATION_FAILED_TEXT,
     ONE_AT_A_TIME_TEXT,
+    SCRIPT_FAILED_TEXT,
     render_caption,
 )
 from telegram_documentaries.models import ChatId
 from telegram_documentaries.photo_handler import Downloader
+from telegram_documentaries.scripter import generate_script
+from telegram_documentaries.scripter_client import ScriptClient
 from telegram_documentaries.state import Phase, SessionStore, StateError
 
 logger = logging.getLogger(__name__)
@@ -37,6 +41,7 @@ logger = logging.getLogger(__name__)
 #: Sends portrait bytes and a caption to a chat. Injected, so tests never touch
 #: Telegram.
 PhotoSender: TypeAlias = Callable[[ChatId, bytes, str], Awaitable[None]]
+TextSender: TypeAlias = Callable[[ChatId, str], Awaitable[None]]
 
 
 class _PhotoBot(Protocol):
@@ -63,6 +68,25 @@ def telegram_photo_sender(bot: _PhotoBot) -> PhotoSender:
 
     async def send(chat_id: ChatId, image_bytes: bytes, caption: str) -> None:
         await _send_portrait(bot, chat_id, image_bytes, caption)
+
+    return send
+
+
+class _TextBot(Protocol):
+    """The slice of ``telegram.Bot`` needed to send a text message."""
+
+    async def send_message(self, chat_id: int, text: str) -> object: ...
+
+
+def telegram_text_sender(bot: _TextBot) -> TextSender:
+    """Build the production :data:`TextSender`, which sends the script as text.
+
+    The text is never logged. Failures propagate to the script step, which decides
+    whether to send the apology.
+    """
+
+    async def send(chat_id: ChatId, text: str) -> None:
+        await bot.send_message(chat_id=chat_id, text=text)
 
     return send
 
@@ -100,6 +124,75 @@ def _fail_run(
     return GENERATION_FAILED_TEXT
 
 
+async def _send_script_apology(chat_id: ChatId, send_text: TextSender) -> None:
+    """Send the fixed apology after a script failure. It never carries the script."""
+    try:
+        await send_text(chat_id, SCRIPT_FAILED_TEXT)
+    except Exception as exc:  # the apology itself is best effort
+        logger.error(
+            "script_apology_failed error_type=%s chat_id=%s",
+            type(exc).__name__,
+            chat_id,
+        )
+
+
+async def _run_script_step(
+    chat_id: ChatId,
+    store: SessionStore,
+    dossier: Dossier,
+    scripts: ScriptClient,
+    send_text: TextSender,
+) -> None:
+    """Write, store, and send the narration text after the portrait is delivered.
+
+    Runs in ``DELIVERING`` with the portrait already sent. The reset epoch guards
+    every step, so a ``/restart`` that lands during the model call drops the late
+    result without a send. A failure sends the apology and keeps the portrait.
+    """
+    epoch = store.epoch(chat_id)
+    if not store.begin_script(chat_id, epoch):
+        logger.info("script_dropped reason=not_started chat_id=%s", chat_id)
+        return
+
+    def still_current() -> bool:
+        # The paid-call guard: no model call is made once the chat has been reset.
+        return store.epoch(chat_id) == epoch
+
+    try:
+        script = await generate_script(dossier, scripts, still_current=still_current)
+    except Exception as exc:  # a Scripter failure is recoverable for the user
+        if store.epoch(chat_id) != epoch:
+            logger.info("script_dropped reason=stale_run chat_id=%s", chat_id)
+            return
+        logger.error(
+            "script_failed error_type=%s chat_id=%s",
+            type(exc).__name__,
+            chat_id,
+        )
+        store.abandon_script(chat_id, epoch)
+        await _send_script_apology(chat_id, send_text)
+        return
+
+    # No await between the epoch check and the commit, so the commit itself is the
+    # guard: a reset that landed during the model call makes it return False.
+    if not store.commit_script(chat_id, epoch, script):
+        logger.info("script_dropped reason=stale_run chat_id=%s", chat_id)
+        return
+    try:
+        await send_text(chat_id, script)
+    except Exception as exc:  # a Telegram failure is recoverable for the user
+        logger.error(
+            "script_send_failed error_type=%s chat_id=%s",
+            type(exc).__name__,
+            chat_id,
+        )
+        if store.epoch(chat_id) != epoch:
+            logger.info("script_dropped reason=stale_run chat_id=%s", chat_id)
+            return
+        # The script stays stored for the Narrator. The send is not retried.
+        await _send_script_apology(chat_id, send_text)
+
+
 async def _generate_and_deliver(
     chat_id: ChatId,
     run: str,
@@ -108,6 +201,8 @@ async def _generate_and_deliver(
     portraits: PortraitClient,
     send_photo: PhotoSender,
     outcome: _RunOutcome,
+    scripts: ScriptClient | None = None,
+    send_text: TextSender | None = None,
 ) -> str | None:
     """Run the steps of one generation, in order, for a run that has started."""
     state = store.get(chat_id)
@@ -193,6 +288,10 @@ async def _generate_and_deliver(
         Phase.DELIVERING,
         dossier.suggested_animal.name,
     )
+    # The script step starts with no await after finish_delivery (S3), so the
+    # in-flight guard covers the gap between the portrait and the script.
+    if scripts is not None and send_text is not None:
+        await _run_script_step(chat_id, store, dossier, scripts, send_text)
     return None
 
 
@@ -203,6 +302,8 @@ async def _run_once(
     portraits: PortraitClient,
     send_photo: PhotoSender,
     outcome: _RunOutcome,
+    scripts: ScriptClient | None = None,
+    send_text: TextSender | None = None,
 ) -> str | None:
     """Start a run, refuse a duplicate, and always abandon the run at the end."""
     run = store.begin_generation(chat_id)
@@ -210,7 +311,15 @@ async def _run_once(
         return ONE_AT_A_TIME_TEXT
     try:
         return await _generate_and_deliver(
-            chat_id, run, store, download, portraits, send_photo, outcome
+            chat_id,
+            run,
+            store,
+            download,
+            portraits,
+            send_photo,
+            outcome,
+            scripts,
+            send_text,
         )
     finally:
         # A no-op once the run has moved on (delivered, or reset by /restart).
@@ -244,6 +353,9 @@ async def run_generation(
     download: Downloader,
     portraits: PortraitClient,
     send_photo: PhotoSender,
+    *,
+    scripts: ScriptClient | None = None,
+    send_text: TextSender | None = None,
 ) -> str | None:
     """Generate and deliver the portrait for a chat that has finished its dossier.
 
@@ -260,7 +372,14 @@ async def run_generation(
     logger.info("stage_start stage=run_generation")
     try:
         reply = await _run_once(
-            chat_id, store, download, portraits, send_photo, outcome
+            chat_id,
+            store,
+            download,
+            portraits,
+            send_photo,
+            outcome,
+            scripts,
+            send_text,
         )
     except Exception as exc:
         outcome.error_type = type(exc).__name__

@@ -1,16 +1,19 @@
-"""Versioned, in-memory per-chat session state (schema v3).
+"""Versioned, in-memory per-chat session state (schema v4).
 
 :class:`SessionStore` is the single writer of session fields. Stages call its
 named methods (``begin_turn``, ``commit_*``, ``release_turn``, ``begin_generation``,
 ``begin_delivery``, ``finish_delivery``, ``fail_delivery``, ``abandon_generation``,
-``reset``) and never mutate a :class:`SessionState`, which is frozen to make that
-rule enforceable. Each commit checks the transition it performs and the invariants
-the state must hold afterwards.
+``begin_script``, ``commit_script``, ``abandon_script``, ``reset``) and never
+mutate a :class:`SessionState`, which is frozen to make that rule enforceable.
+Each commit checks the transition it performs and the invariants the state must
+hold afterwards.
 
 Generation runs are guarded by an opaque run token. A driver method that takes a
 token changes nothing unless the token is the chat's current one, so a result that
 arrives after a reset cannot change a newer state. Each reset also advances a
-per-chat epoch, which lets the interview stages drop a late model reply.
+per-chat epoch, which lets the interview stages drop a late model reply. The script
+step has no run token (``begin_delivery`` clears it), so its driver methods are
+guarded by the epoch alone.
 """
 
 from __future__ import annotations
@@ -27,8 +30,9 @@ from telegram_documentaries.models import ChatId
 
 #: Bump when ``SessionState`` changes incompatibly; old states are discarded.
 #: Version 1 was the Phase 2 Bouncer state (``last_file_id``). Version 2 had no
-#: generation run token (Phase 4 added it).
-STATE_VERSION = 3
+#: generation run token (Phase 4 added it). Version 3 had no stored script (Phase 5
+#: added it).
+STATE_VERSION = 4
 
 
 class StateError(RuntimeError):
@@ -66,6 +70,7 @@ class SessionState(BaseModel):
     dossier: Dossier | None = None
     in_flight: bool = False
     generation_run: str | None = None
+    script: str | None = None
 
 
 def _check_invariants(state: SessionState) -> None:
@@ -78,6 +83,8 @@ def _check_invariants(state: SessionState) -> None:
         raise StateError("a question is outstanding only while interviewing")
     if (state.generation_run is not None) != (state.phase is Phase.GENERATING):
         raise StateError("a generation run is set exactly while generating")
+    if state.script is not None and state.phase is not Phase.DELIVERING:
+        raise StateError("a script is set only while delivering")
 
 
 class SessionStore:
@@ -226,6 +233,54 @@ class SessionStore:
             in_flight=False,
             generation_run=None,
         )
+        return True
+
+    def begin_script(self, chat_id: ChatId, epoch: int) -> bool:
+        """Start the script step in ``DELIVERING``, after the portrait is sent.
+
+        Returns ``False`` and changes nothing if the chat was reset since ``epoch``,
+        is not in ``DELIVERING``, already has a script, or has a turn in flight.
+        """
+        state = self.get(chat_id)
+        if (
+            self.epoch(chat_id) != epoch
+            or state.phase is not Phase.DELIVERING
+            or state.script is not None
+            or state.in_flight
+        ):
+            return False
+        self._replace(chat_id, in_flight=True)
+        return True
+
+    def commit_script(self, chat_id: ChatId, epoch: int, text: str) -> bool:
+        """Store a validated script and clear ``in_flight``.
+
+        Returns ``False`` and changes nothing if the chat was reset since ``epoch``
+        or no script step is in flight in ``DELIVERING``. A late result therefore
+        cannot write into a newer session.
+        """
+        state = self.get(chat_id)
+        if (
+            self.epoch(chat_id) != epoch
+            or state.phase is not Phase.DELIVERING
+            or not state.in_flight
+        ):
+            return False
+        self._replace(chat_id, script=text, in_flight=False)
+        return True
+
+    def abandon_script(self, chat_id: ChatId, epoch: int) -> bool:
+        """Clear ``in_flight`` after a failed script step. ``script`` stays ``None``.
+
+        Returns ``False`` and changes nothing if the chat was reset since ``epoch``
+        or is not in ``DELIVERING``.
+        """
+        if (
+            self.epoch(chat_id) != epoch
+            or self.get(chat_id).phase is not Phase.DELIVERING
+        ):
+            return False
+        self._replace(chat_id, in_flight=False)
         return True
 
     def epoch(self, chat_id: ChatId) -> int:

@@ -196,3 +196,18 @@ def test_the_image_model_id_is_written_exactly_once_in_the_source_tree() -> None
     )
 
     assert occurrences == 1
+
+
+# --- Phase 5: the Scripter model is defined once -------------------------------
+
+FLASH_LITE_MODEL = "gemini-3.1-flash-lite"
+
+
+def test_the_scripter_model_is_the_flash_lite_model() -> None:
+    assert MODELS["scripter"] == FLASH_LITE_MODEL
+
+
+def test_the_flash_lite_model_id_is_written_once_in_config_module() -> None:
+    config_source = Path(config_module.__file__).read_text(encoding="utf-8")
+
+    assert config_source.count(FLASH_LITE_MODEL) == 1

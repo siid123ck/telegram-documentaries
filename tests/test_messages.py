@@ -27,6 +27,7 @@ from telegram_documentaries.messages import (
     PHOTO_MID_INTERVIEW_TEXT,
     RESEND_ANSWER_TEXT,
     RESEND_TEXT,
+    SCRIPT_FAILED_TEXT,
     render_caption,
     render_dossier,
 )
@@ -279,6 +280,68 @@ def test_the_caption_stays_well_under_the_telegram_limit() -> None:
     ids=["opening-prompt", "already-done", "one-at-a-time"],
 )
 def test_the_reused_copy_literal_is_written_once_in_the_package(text: str) -> None:
+    package_dir = Path(messages.__file__).parent
+
+    occurrences = sum(
+        path.read_text(encoding="utf-8").count(text)
+        for path in package_dir.rglob("*.py")
+    )
+
+    assert occurrences == 1
+
+
+# --- Phase 5: script failure copy ---------------------------------------------
+
+_SCRIPT_FAILURE_FORBIDDEN = (
+    "traceback",
+    "error",
+    "exception",
+    "timeout",
+    "timed out",
+    "rate",
+    "unavailable",
+    "provider",
+    "gemini",
+    "model",
+    "validation",
+    "invalid",
+    "http",
+    "429",
+    "500",
+    "503",
+    "{",
+    "}",
+)
+
+
+def test_the_script_failure_text_is_non_empty() -> None:
+    assert SCRIPT_FAILED_TEXT.strip()
+
+
+def test_the_script_failure_text_names_restart() -> None:
+    assert "/restart" in SCRIPT_FAILED_TEXT
+
+
+def test_the_script_failure_text_says_the_portrait_stands() -> None:
+    lowered = SCRIPT_FAILED_TEXT.lower()
+
+    assert "portrait" in lowered
+    assert "stands" in lowered
+
+
+@pytest.mark.parametrize("forbidden", _SCRIPT_FAILURE_FORBIDDEN)
+def test_the_script_failure_text_carries_no_internals(forbidden: str) -> None:
+    assert forbidden not in SCRIPT_FAILED_TEXT.lower()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [messages.OPENING_PROMPT, messages.ALREADY_DONE_TEXT, messages.ONE_AT_A_TIME_TEXT],
+    ids=["opening-prompt", "already-done", "one-at-a-time"],
+)
+def test_the_script_step_reuses_existing_copy_without_redefining_it(
+    text: str,
+) -> None:
     package_dir = Path(messages.__file__).parent
 
     occurrences = sum(

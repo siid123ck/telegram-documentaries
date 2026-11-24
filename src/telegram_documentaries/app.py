@@ -27,11 +27,15 @@ from telegram_documentaries import __version__
 from telegram_documentaries.config import describe_config_source, load_settings
 from telegram_documentaries.converter_client import AdkPortraitClient
 from telegram_documentaries.errors import ConfigError
-from telegram_documentaries.generation import telegram_photo_sender
+from telegram_documentaries.generation import (
+    telegram_photo_sender,
+    telegram_text_sender,
+)
 from telegram_documentaries.interview_client import AdkInterviewClient
 from telegram_documentaries.logging_setup import configure_logging
 from telegram_documentaries.photo_handler import telegram_downloader
 from telegram_documentaries.routing import UpdateRouter
+from telegram_documentaries.scripter_client import AdkScriptClient
 from telegram_documentaries.state import SessionStore
 from telegram_documentaries.vision_client import AdkVisionClient
 
@@ -77,6 +81,8 @@ def _build_application(token: str, gemini_api_key: str) -> TelegramApplication:
         download=telegram_downloader(application.bot),
         portraits=AdkPortraitClient(api_key=gemini_api_key),
         send_photo=telegram_photo_sender(application.bot),
+        scripts=AdkScriptClient(api_key=gemini_api_key),
+        send_text=telegram_text_sender(application.bot),
     )
     restart_cb = _update_callback(router.handle_restart)
     text_cb = _update_callback(router.handle_text)

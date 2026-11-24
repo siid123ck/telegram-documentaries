@@ -19,6 +19,7 @@ _IMAGE = "gemini-3.1-flash-image"
 MODELS: dict[str, str] = {
     "bouncer": _FLASH_LITE,
     "interviewer": _FLASH_LITE,
+    "scripter": _FLASH_LITE,
     "converter": _IMAGE,
 }
 
