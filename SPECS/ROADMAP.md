@@ -224,7 +224,8 @@ live Telegram/Gemini verification deferred. Not `[x]` until the verifier passes.
   user's recognisable features while fusing the dossier's animal and traits.
 - Returned image is delivered to the chat with a short caption naming the
   animal.
-- Temp file written outside the repo, deleted after send.
+- ~~Temp file written outside the repo, deleted after send.~~ Superseded by D15: the
+  portrait is sent from memory, so no temp file is written.
 - Failure path: apologise, keep the dossier, offer `/restart`.
 
 **Acceptance criteria**
@@ -237,7 +238,67 @@ live Telegram/Gemini verification deferred. Not `[x]` until the verifier passes.
 
 **Serves:** multimodal image generation + delivery.
 
-Status: `[ ]`
+Status: `[~]` — implemented and offline-verified on `feature/2026-11-24-converter`; live Telegram/Gemini verification deferred. Not `[x]` until the open items below are closed.
+
+> **Implementation notes (2026-11-24, branch `feature/2026-11-24-converter`, uncommitted; verifier pending).**
+>
+> - **Spike (plan group 0):** route (a), ADK's Gemini wrapper, was assessed against
+>   `google-adk` 2.14.1. The image bytes would be read from ADK runner events, which
+>   cannot be checked offline. Route (b) was chosen: `converter_client.py` calls
+>   `google.genai` directly with `response_modalities=["IMAGE"]`. No dependency was
+>   added. The outcome is recorded at the top of `converter_client.py`.
+> - **PTB default (plan group 0):** `Application.builder()` uses
+>   `max_concurrent_updates=1`, which serialises updates. `app.py` now calls
+>   `concurrent_updates(True)` so a `/restart` or a duplicate runs during a generation.
+> - **Deviation from the bullets above:** no temp file. The portrait goes to Telegram
+>   from memory through `BytesIO` (requirements D15).
+> - **Decisions:** requirements D1 to D18 apply. The generation timeout is 60 s (D9),
+>   the attempt bound is 2 (D10), and a failed run returns to `DOSSIER_READY` with the
+>   answers kept (D2). The caption is a fixed template (D11, D16).
+> - **Beyond the spec:** a stale model result is dropped after `/restart` for the
+>   interview and photo stages too (`SessionStore.epoch` and `require_current`). Such
+>   a drop is logged at `info` by `log_stage` through `StaleResult`.
+> - **Open for the Tech Lead:** the likeness wording (requirements Open decision 1);
+>   the 60 s timeout (D9); the name `AdkPortraitClient`, which is kept from the spec
+>   but uses genai, not ADK (route b); and two `google.adk` string literals in test
+>   subprocess guards, which a grep of `tests/` will hit.
+> - **Verified offline:** `scripts/test` and `scripts/hooks` exit 0. All validation
+>   sections A to N are covered by offline tests. Section O (live) is deferred, and no
+>   live bot run or model call was made.
+
+
+> **Verifier note (2026-11-24, branch `feature/2026-11-24-converter`, uncommitted).**
+>
+> - **Verified offline:** `scripts/test` exits 0 (589 tests: ruff check, ruff format
+>   --check, mypy, pytest). `scripts/hooks` exits 0. An injected unused import fails
+>   `scripts/test` with exit 1 (scratch copy). The suite passes with no `.env` and no
+>   credentials in the environment. `uv sync --locked` exits 0. No dependency change.
+>   `gemini-3.1-flash-image` appears once in `config.py`. No ADK or genai import in
+>   `tests/`. No `tempfile`, `write_bytes`, or `open(` for media in `src/`. No state
+>   write outside `state.py`. No secret value, key, token, or image byte appears in
+>   any tracked or untracked file.
+> - **Tech Lead decisions recorded:** concurrent updates (D5), the 60 s timeout (D9),
+>   the likeness wording (recognisable features kept, stylisation allowed), failure
+>   returning to `DOSSIER_READY` (D2), the two-line caption template (D11, D16), the
+>   paid-call guard (run token checked before every model call, including the retry),
+>   and outcome=error logging for a failed run. All are in `requirements.md`, "Tech
+>   Lead decisions".
+> - **Open, which keeps `[~]`:**
+>   1. **Red-first evidence (validation B3, F5).** No red run was kept, and the work is
+>      uncommitted. The Tech Lead must accept the exception, as in Phase 3.
+>   2. **D1, D3, D4, D6, D7, D8, D12, D13, D14, D15, D17, D18 (validation N3).** These
+>      were not in this round's list. The Tech Lead must confirm or revise them.
+>   3. **Minor, non-blocking (plan.md, deviations 8 and 9).** A failed dossier text
+>      reply leaves the chat in `DOSSIER_READY` with no apology. A `/restart` during a
+>      photo check gives the next photo one-at-a-time nudge.
+> - **Deviations, recorded (plan.md, "Deviations"):** the spike used route (b),
+>   `google.genai` direct; `run_generation` logs its own outcome instead of
+>   `@log_stage`; `generate_portrait` has the `still_current` guard; the stale-result
+>   drop also covers the Phase 3 stages; the temp-file bullet above is superseded by
+>   D15, since the portrait is sent from memory.
+> - **Live Telegram and Gemini checks: DEFERRED (validation section O, and L).** No
+>   live bot run and no model call were made. No live pass is claimed. A real
+>   `TELEGRAM_BOT_TOKEN` and `GEMINI_API_KEY` are needed for the deferred checks.
 
 ---
 

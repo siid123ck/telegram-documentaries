@@ -79,6 +79,24 @@ def render_subject(raw: str) -> str:
     return capped or FALLBACK_SUBJECT
 
 
+#: Sent when a portrait run fails. It offers ``/restart`` and carries no detail.
+GENERATION_FAILED_TEXT = (
+    "Sorry — the portrait studio jammed on that one. Send /restart to try again."
+)
+
+#: Second caption line. Fixed copy, not per-animal and never model prose (D16).
+CAPTION_SECOND_LINE = "Filmed in its natural habitat, unaware it is being watched."
+
+
+def render_caption(animal_name: str) -> str:
+    """Return the two-line portrait caption.
+
+    Line one names the animal, after :func:`render_subject` has removed markup,
+    newlines, and any injected text and capped the length. Line two is fixed copy.
+    """
+    return f"Specimen: the {render_subject(animal_name)}.\n{CAPTION_SECOND_LINE}"
+
+
 def render_dossier(dossier: Dossier) -> str:
     """Render the finished dossier as one plain-text message.
 

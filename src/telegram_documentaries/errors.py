@@ -54,6 +54,14 @@ class ProviderRejected(VisionError):
         super().__init__(message)
 
 
+class StaleResult(Exception):
+    """A model result arrived after ``/restart`` reset its chat. It is dropped.
+
+    This is an expected outcome, not a failure: the stage logs it at ``info``, and
+    the routing layer sends nothing for it.
+    """
+
+
 class InvalidResponse(VisionError):
     """The vision provider returned data that failed contract validation.
 

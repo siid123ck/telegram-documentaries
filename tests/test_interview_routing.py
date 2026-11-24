@@ -16,8 +16,10 @@ import pytest
 from fakes import (
     FakeDownloader,
     FakeInterviewClient,
+    FakePortraitClient,
     FakeVisionClient,
     GatedDownloader,
+    RecordingPhotoSender,
     RecordingSender,
     ask,
     dossier,
@@ -69,6 +71,8 @@ def _router(
         interview=interview,
         store=store,
         download=download if download is not None else FakeDownloader(),
+        portraits=FakePortraitClient(),
+        send_photo=RecordingPhotoSender(),
         reply=sender,
     )
     return router, sender, store, vision, interview
@@ -126,7 +130,7 @@ async def test_a_photo_mid_interview_gets_the_nudge_without_the_bouncer() -> Non
     assert store.get(_CHAT).outstanding_question == "First?"
 
 
-async def test_a_photo_in_dossier_ready_gets_the_already_done_nudge() -> None:
+async def test_a_photo_after_delivery_gets_the_already_done_nudge() -> None:
     interview = FakeInterviewClient(
         [ask("Q1?"), ask("Q2?"), ask("Q3?"), ask("Q4?"), ask("Q5?"), finish()]
     )
@@ -134,7 +138,7 @@ async def test_a_photo_in_dossier_ready_gets_the_already_done_nudge() -> None:
     await _start_interview(router, store, sender)
     for index in range(1, 6):
         await _send_text(router, f"answer {index}", update_id=index + 1)
-    assert store.get(_CHAT).phase is Phase.DOSSIER_READY
+    assert store.get(_CHAT).phase is Phase.DELIVERING
     sent_before = len(sender.sent)
 
     await _send_photo(router, "late-photo")
@@ -188,7 +192,9 @@ async def test_empty_text_while_interviewing_is_nudged_and_not_stored() -> None:
     assert interview.calls == 1
 
 
-async def test_text_in_dossier_ready_gets_the_already_done_nudge() -> None:
+async def test_text_after_the_portrait_is_delivered_gets_the_already_done_nudge() -> (
+    None
+):
     interview = FakeInterviewClient(
         [ask("Q1?"), ask("Q2?"), ask("Q3?"), ask("Q4?"), ask("Q5?"), finish()]
     )
@@ -201,7 +207,7 @@ async def test_text_in_dossier_ready_gets_the_already_done_nudge() -> None:
     await _send_text(router, "one more thing")
 
     assert sender.sent[sent_before:] == [ALREADY_DONE_TEXT]
-    assert store.get(_CHAT).phase is Phase.DOSSIER_READY
+    assert store.get(_CHAT).phase is Phase.DELIVERING
     assert store.get(_CHAT).dossier is not None
 
 
@@ -296,14 +302,17 @@ async def test_restart_after_the_dossier_is_ready_discards_it() -> None:
     assert store.get(_CHAT).phase is Phase.AWAITING_PHOTO
 
 
-async def test_restart_during_a_model_call_is_nudged_and_changes_nothing() -> None:
+async def test_restart_during_a_model_call_resets_at_once_and_sends_the_opening() -> (
+    None
+):
     router, sender, store, _, _ = _router()
     store.begin_turn(_CHAT)
 
     await router.handle_restart(text_update("/restart"))
 
-    assert sender.sent == [ONE_AT_A_TIME_TEXT]
-    assert store.get(_CHAT).in_flight is True
+    assert sender.sent == [OPENING_PROMPT]
+    assert store.get(_CHAT).phase is Phase.AWAITING_PHOTO
+    assert store.get(_CHAT).in_flight is False
 
 
 # --- The in-flight guard covers every update kind -----------------------------

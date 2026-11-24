@@ -16,6 +16,8 @@ import time
 from collections.abc import Callable, Coroutine
 from typing import Any, ParamSpec, TypeVar, cast
 
+from telegram_documentaries.errors import StaleResult
+
 P = ParamSpec("P")
 T = TypeVar("T")
 
@@ -138,6 +140,14 @@ def log_stage(func: Callable[P, T]) -> Callable[P, T]:
             module_logger.info("stage_start stage=%s", stage_name)
             try:
                 result = await async_func(*args, **kwargs)
+            except StaleResult:
+                # Expected after a /restart: the result is dropped, not a failure.
+                module_logger.info(
+                    "stage_dropped stage=%s reason=stale_run duration_ms=%.2f",
+                    stage_name,
+                    (time.monotonic() - start) * 1000,
+                )
+                raise
             except Exception as exc:  # noqa: BLE001 — log and re-raise
                 duration_ms = (time.monotonic() - start) * 1000
                 module_logger.error(

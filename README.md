@@ -4,8 +4,9 @@ A Telegram bot that, eventually, turns a user's portrait photo into a comedy
 wildlife documentary *about them*: a hybrid animal portrait plus a short,
 hushed, Attenborough-style voice note narrating "this magnificent specimen".
 
-**Current status: Phase 3 — Interviewer (conversation engine + dossier), offline-verified.**
-Once a photo passes the Bouncer, the bot interviews the subject. While the bot is
+**Current status: Phase 4 — Converter (hybrid portrait), offline-verified.**
+Once a photo passes the Bouncer, the bot interviews the subject, then turns the
+dossier and the original photo into one hybrid animal portrait. While the bot is
 waiting for a photo, every text message still gets the fixed reply `hey mate!`. A
 **photo** goes through the Bouncer, a Gemini vision check that decides whether a
 human is in the picture:
@@ -39,12 +40,41 @@ human is in the picture:
   three to seven quirks (topic and observation), then one suggested animal and a
   short reason. Nothing else is shown. The image, narration, and voice note come in
   later phases.
-- **`/restart`** works in any phase and discards the photo, the answers, the
-  question, and any dossier. The bot replies with the opening prompt. Other chats
-  are not affected. If a model call is still running for your chat, `/restart` gets
-  the one-at-a-time nudge instead and you can send it again in a moment.
-- While a model call is running for your chat, any new message gets a short
-  *"One at a time, please"* nudge and changes nothing.
+- **`/restart`** works in any phase, including while the portrait is being
+  generated. It discards the photo, the answers, the question, the dossier, and any
+  portrait still in progress, and the bot replies with the opening prompt at once.
+  Other chats are not affected. A model result that arrives after the restart is
+  dropped without a message.
+- While a model call is running for your chat, any new message (text or photo) gets
+  a short *"One at a time, please"* nudge and changes nothing.
+
+### The portrait
+
+- When the interview finishes, the bot sends the dossier text first (as above). It
+  then starts the portrait **automatically**; you do not confirm.
+- The model gets your original photo and the dossier, and returns **one hybrid
+  animal portrait**. The likeness rule is that your recognisable features are kept
+  and a stylised look is allowed. The Tech Lead confirmed this wording on
+  2026-11-24. A visual check of a real portrait is deferred until live credentials
+  are supplied (see [Known limitations](#known-limitations)).
+- The portrait is sent as a photo with a **two-line caption**: line one names the
+  suggested animal (`Specimen: the <animal>.`), and line two is a fixed line of
+  copy. The caption never contains the model's own prose.
+- The image is sent from memory. No temporary file is written, and the portrait and
+  the photo are not kept after the send.
+- Each run makes **one** portrait attempt, with a second attempt only after a
+  timeout, a rate limit, or a server error. Each attempt has a 60-second limit. A
+  rejected request is not retried. A reply that is not a PNG or JPEG image is not
+  retried and is not sent.
+- If the portrait fails, the bot sends a short apology that names `/restart`. Your
+  answers and dossier are kept, so `/restart` is how you start over.
+- The chat is in the **`GENERATING`** phase while the portrait is being made. Once
+  the model's image has been checked and is handed to Telegram, the chat moves to
+  **`DELIVERING`**.
+- After the portrait is sent, the chat **rests** in `DELIVERING`. Text and photos
+  then get the *"Your dossier is complete"* nudge, and `/restart` starts a new
+  subject. The Scripter and voice note come in a later phase, so nothing else
+  happens after the portrait until `/restart`.
 
 Other messages (voice notes, stickers, edits, channel posts) are ignored without
 crashing the process. Live Telegram and Gemini verification is **deferred** until
@@ -64,12 +94,12 @@ Telegram update -> transport adapter -> orchestrator (state machine)
                                         -> Telegram send
 ```
 
-So far the **gateway**, the **Bouncer**, and the **Interviewer** exist. The Bouncer
-and the Interviewer are Google ADK agents behind a small seam each. The Interviewer
-is the orchestrator: it owns the chat's phases `AWAITING_PHOTO → INTERVIEWING →
-DOSSIER_READY` in a versioned, in-memory session keyed by chat. The Converter,
-Scripter, and Narrator, and the `GENERATING` and `DELIVERING` phases, are deliberately
-deferred to later phases (see
+So far the **gateway**, the **Bouncer**, the **Interviewer**, and the **Converter**
+exist. The Bouncer and the Interviewer are Google ADK agents behind a small seam
+each. The Converter calls the image model through its own seam. The orchestrator
+owns the chat's phases `AWAITING_PHOTO → INTERVIEWING → DOSSIER_READY → GENERATING
+→ DELIVERING` in a versioned, in-memory session keyed by chat. The Scripter and
+Narrator are deliberately deferred to later phases (see
 [Not supported / deliberately deferred](#not-supported--deliberately-deferred)).
 
 ## Prerequisites
@@ -96,7 +126,7 @@ Then edit `.env` and fill in real values. The file (and its committed template
 | Variable | Purpose |
 | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | Bot token from [@BotFather](https://t.me/BotFather) (**requires credentials**). |
-| `GEMINI_API_KEY` | Google AI API key used by the Bouncer vision gate and the Interviewer (**requires credentials**). |
+| `GEMINI_API_KEY` | Google AI API key used by the Bouncer vision gate, the Interviewer, and the portrait Converter (**requires credentials**). |
 
 > **Placeholder values fail fast by design.** `.env.example` ships markers such
 > as `your_telegram_bot_token_here`. With those in place, the bot refuses to
@@ -120,7 +150,9 @@ version, and the config source (`file:.env` or `environment`) — never the valu
 Send any text message before a photo and it replies `hey mate!`. Send a photo and
 the Bouncer decides: a person starts the interview with the first question, anything
 else gets the in-character rejection, and a vision failure asks you to resend. Answer
-the questions one at a time; send `/restart` to begin again.
+the questions one at a time. When the dossier is ready, the bot sends it and then a
+hybrid animal portrait with a two-line caption (or a short apology that names
+`/restart` if the portrait fails). Send `/restart` to begin again.
 Press **Ctrl-C** to stop cleanly.
 
 Without a real token (the current placeholder setup), the same command exits
@@ -169,7 +201,8 @@ so it needs network access once.
 src/telegram_documentaries/   package (config, errors, logging, gateway, app, entrypoint,
                               models, state, bouncer, vision_client, prompts,
                               photo_handler, messages, interview_models,
-                              interview_client, interview, routing)
+                              interview_client, interview, converter_models,
+                              converter_client, converter, generation, routing)
 tests/                        offline unit tests
 scripts/test, scripts/hooks   ground-truth dev scripts
 .env.example                  documented config contract (placeholders)
@@ -183,9 +216,11 @@ These are **out of scope** and will not work yet; they need a later spec:
 - **Webhooks, public URLs, inbound HTTP servers** — transport is long polling only.
 - **Persistence / restart survival** — session state is in memory only; a restart
   clears every chat's photo state.
-- **The rest of the pipeline (Phases 4–7)** — no Converter, image generation,
-  Scripter, Narrator/TTS, `GENERATING`, or `DELIVERING`. The dossier is delivered as
-  text and goes no further.
+- **The rest of the pipeline (Phases 5–7)** — no Scripter, Narrator/TTS, or voice
+  notes. After the portrait is sent, the chat rests in `DELIVERING` until `/restart`.
+- **Editing or regenerating the portrait** — there is no second image and no
+  "try another" command. A failed run is retried only by `/restart` and a new
+  interview.
 - **Editing answers or the dossier** — there is no "go back" command, and a
   dossier cannot be regenerated. Use `/restart` to start over.
 - **Authored `/start` behaviour** — `/start` is still delivered as plain text, so
@@ -211,13 +246,29 @@ These are **out of scope** and will not work yet; they need a later spec:
 - **One action at a time per chat.** A message that arrives while a photo or model
   call is still being handled gets a short "one at a time" nudge.
 - **In memory only.** A restart clears every chat's interview.
-- **Live Telegram and Gemini checks for Phase 3 are deferred.** The interview, the
-  5-to-7 range, `/restart`, and the nudges are covered by the offline suite only.
+- **Live Telegram and Gemini checks for Phases 3 and 4 are deferred.** The interview,
+  the 5-to-7 range, `/restart`, the portrait, the caption, and the nudges are covered
+  by the offline suite only.
+- **The live image call is not yet verified.** The portrait request to
+  `gemini-3.1-flash-image` has only been exercised with scripted fakes. Its real reply
+  (whether it contains inline PNG or JPEG bytes) has not been checked, so the
+  portrait path is unproven against Gemini until a credentialed run is done.
+- **Likeness is not yet checked on a real portrait.** The wording (recognisable
+  features kept, stylisation allowed) is confirmed by the Tech Lead. Whether a real
+  portrait meets it is a visual check that needs a credentialed run.
+- **A `/restart` that lands during the send can still deliver one portrait.** The
+  photo may already be on its way when the reset happens. This race is accepted and
+  logged at info.
+- **Updates are processed concurrently.** So a `/restart` or a duplicate is handled
+  while a portrait is being generated. This changes the earlier handlers too, and is
+  checked offline only.
 - The Bouncer's free-form `reason` is logged but never shown to the user.
 - Answers and model text are never logged. Logs record the chat id, phase
   changes, the question index, and the suggested animal's name only.
 - Image bytes are always sent to the model as `image/jpeg`, since Telegram photo
   sizes are always JPEG.
+- The portrait's bytes are checked by their magic bytes (PNG or JPEG) and a 10 MiB
+  limit. The file type is never taken from the model.
 
 See `SPECS/ROADMAP.md` for the phase plan and `SPECS/` for the full contracts and
 validation checklist.
