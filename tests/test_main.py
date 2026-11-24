@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr
 from telegram.error import InvalidToken
-from telegram.ext import Application
+from telegram.ext import Application, CommandHandler, MessageHandler
 
 import telegram_documentaries.app as app_module
 from telegram_documentaries import __version__, logging_setup
@@ -104,8 +104,8 @@ def test_valid_settings_build_the_app_and_start_polling_once(
     assert len(polled) == 1
     application = polled[0]
     assert isinstance(application, Application)
-    # One text handler (Phase 1 reply) and one photo handler (Bouncer intake).
-    assert sum(len(handlers) for handlers in application.handlers.values()) == 2
+    # One /restart command, one text route, and one photo route.
+    assert sum(len(handlers) for handlers in application.handlers.values()) == 3
     assert application.bot.token == TEST_TOKEN
 
 
@@ -198,3 +198,16 @@ def test_module_entrypoint_with_placeholders_exits_2_without_traceback(
     assert "see .env.example" in combined
     assert PLACEHOLDER_TOKEN not in combined
     assert PLACEHOLDER_KEY not in combined
+
+
+def test_the_restart_command_is_routed_before_the_text_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    polled = _patch_happy_path(monkeypatch)
+
+    app_module.main()
+
+    first_group = polled[0].handlers[0]  # type: ignore[attr-defined]
+    assert isinstance(first_group[0], CommandHandler)
+    assert "restart" in first_group[0].commands
+    assert isinstance(first_group[1], MessageHandler)

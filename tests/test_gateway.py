@@ -1,23 +1,19 @@
-"""Tests for the Phase 1 gateway: text in, fixed reply out.
+"""Tests for the phase-one reply rules: text in, fixed reply out.
 
 All Telegram objects here are constructed locally as plain data classes; no
-``Bot`` is created and no network call is made. The async handler is exercised
-through an injected sender seam so the send path is observable offline.
+``Bot`` is created and no network call is made. Routing by phase is tested in
+``test_interview_routing.py``.
 """
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import TypeAlias
 
 import pytest
 from telegram import Chat, Message, PhotoSize, Sticker, Update, Voice
 
-from telegram_documentaries.gateway import REPLY_TEXT, build_reply, handle_message
-
-ReplySender: TypeAlias = Callable[[Update, str], Awaitable[None]]
+from telegram_documentaries.gateway import REPLY_TEXT, build_reply
 
 _NOW = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -85,53 +81,3 @@ def test_edited_message_and_channel_post_produce_no_exception() -> None:
 
 def test_update_with_no_message_produces_no_reply() -> None:
     assert build_reply(Update(update_id=1)) is None
-
-
-async def test_handler_sends_the_reply_without_touching_the_network() -> None:
-    calls: list[tuple[Update, str]] = []
-
-    async def fake_sender(update: Update, text: str) -> None:
-        calls.append((update, text))
-
-    update = _text_update("Hello")
-    await handle_message(update, None, sender=fake_sender)  # type: ignore[arg-type]
-
-    assert calls == [(update, REPLY_TEXT)]
-
-
-async def test_handler_does_not_send_for_non_text_updates() -> None:
-    calls: list[tuple[Update, str]] = []
-
-    async def fake_sender(update: Update, text: str) -> None:
-        calls.append((update, text))
-
-    for update in _non_text_updates():
-        await handle_message(update, None, sender=fake_sender)  # type: ignore[arg-type]
-
-    assert calls == []
-
-
-async def test_handler_catches_send_error_logs_it_and_serves_next_update(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    class BoomSender:
-        def __init__(self) -> None:
-            self.calls: list[str] = []
-
-        async def __call__(self, update: Update, text: str) -> None:
-            self.calls.append(text)
-            if len(self.calls) == 1:
-                raise RuntimeError("send failed")
-
-    boom = BoomSender()
-
-    with caplog.at_level(logging.ERROR):
-        await handle_message(_text_update("first"), None, sender=boom)  # type: ignore[arg-type]
-
-    assert any(record.levelno >= logging.ERROR for record in caplog.records)
-
-    async def good_sender(update: Update, text: str) -> None:
-        boom.calls.append(text)
-
-    await handle_message(_text_update("second"), None, sender=good_sender)  # type: ignore[arg-type]
-    assert boom.calls == [REPLY_TEXT, REPLY_TEXT]

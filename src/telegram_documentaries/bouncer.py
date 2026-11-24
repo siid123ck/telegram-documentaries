@@ -1,8 +1,9 @@
-"""Bouncer stage: classify a photo and update minimal per-chat state.
+"""Bouncer stage: classify a photo and return a typed verdict.
 
-This module has no Telegram or ADK dependency and emits no user-facing text: it
-returns a typed :class:`VisionVerdict` for the routing layer to render. It talks
-to the vision provider only through the :class:`VisionClient` protocol.
+This module has no Telegram or ADK dependency, writes no session state, and emits
+no user-facing text: it returns a :class:`VisionVerdict` for the routing layer to
+act on. It talks to the vision provider only through the :class:`VisionClient`
+protocol.
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ import logging
 from telegram_documentaries.errors import InvalidResponse
 from telegram_documentaries.logging_setup import log_stage
 from telegram_documentaries.models import PhotoPayload, VisionVerdict
-from telegram_documentaries.state import SessionStore
 from telegram_documentaries.vision_client import VisionClient, classify_with_retry
 
 logger = logging.getLogger(__name__)
@@ -31,17 +31,14 @@ def _repair_note(error: InvalidResponse) -> str:
 
 
 @log_stage
-async def inspect(
-    photo: PhotoPayload, client: VisionClient, store: SessionStore
-) -> VisionVerdict:
-    """Classify ``photo``, then record the outcome in ``store``.
+async def inspect(photo: PhotoPayload, client: VisionClient) -> VisionVerdict:
+    """Classify ``photo`` and return the verdict. The Bouncer writes no state.
 
     An invalid model response gets exactly one repair attempt that carries the
     validation summary; a second invalid response raises :class:`InvalidResponse`.
-    A passing verdict stores the photo reference; a failing one resets the chat.
-    The verdict is returned unchanged and no message is emitted here. Provider
-    errors propagate before any state mutation, so a failed call leaves the chat
-    untouched.
+    Recording the photo is the interview's job: it happens only when the first
+    question is committed, so a rejected or failed photo never reaches the session.
+    The verdict is returned unchanged and no message is emitted here.
     """
     try:
         verdict = await classify_with_retry(client, photo)
@@ -49,10 +46,6 @@ async def inspect(
         verdict = await classify_with_retry(
             client, photo, repair_note=_repair_note(exc)
         )
-    if verdict.contains_human:
-        store.note_photo(photo.chat_id, photo.file_id)
-    else:
-        store.reset(photo.chat_id)
     logger.info(
         "bouncer_verdict chat_id=%s contains_human=%s detected_subject=%s",
         photo.chat_id,

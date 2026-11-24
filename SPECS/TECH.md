@@ -49,7 +49,23 @@ routing and state, not prompt text or HTTP details.
 
 Explicit phases, no booleans-as-state:
 
-`IDLE` → `AWAITING_PHOTO` → `INTERVIEWING` → `GENERATING` → `DELIVERING` → `IDLE`
+`IDLE` → `AWAITING_PHOTO` → `INTERVIEWING` → `DOSSIER_READY` (confirmed 2026-11-24)
+→ `GENERATING` → `DELIVERING` → `IDLE`
+
+Driven today: `AWAITING_PHOTO`, `INTERVIEWING`, `DOSSIER_READY`. `GENERATING` and
+`DELIVERING` are declared but have no transitions yet (Phases 4–6). Phase 4 adds
+`DOSSIER_READY → GENERATING`.
+
+Interview rules (confirmed 2026-11-24):
+
+- A passing photo moves `AWAITING_PHOTO → INTERVIEWING` and sends the first
+  question. It does not send `hey mate!` (deliberate change to the Phase 2 pass path).
+- `DOSSIER_READY` is terminal for the interview. Any text or photo gets a nudge
+  to use `/restart`; no state change.
+- While a question is outstanding, `/start` is taken as an answer. Phase 7 owns
+  `/start` behaviour.
+- The in-flight guard uses the shared "One at a time, please" copy (the Bouncer's
+  `ONE_AT_A_TIME_TEXT`). It is reused for both phases.
 
 - Every inbound update is routed by `(phase, payload type)`. Unhandled
   combinations produce a nudge (or are ignored for Telegram noise such as
@@ -70,6 +86,17 @@ Explicit phases, no booleans-as-state:
   output. Reset never restarts the process and never touches other chats.
 - Every user-visible outbound message must be derivable from the session; nothing
   may be assumed from a previously sent message that is not stored.
+
+### Interview limits (confirmed 2026-11-24)
+
+| Limit | Value | Where enforced |
+|---|---|---|
+| Questions per interview | 5 minimum, 7 maximum (the code forces `finish` at 7) | `interview_models.py`, `interview.py` |
+| Question text | 1–300 characters, single line | `interview_models.py` |
+| Answer text | 1–1000 characters after trimming | `interview_models.py`, `interview.py` |
+| Quirks in a dossier | 3–7 | `interview_models.py` |
+| Quirk topic / observation | 1–40 / 1–300 characters | `interview_models.py` |
+| Suggested animal name / reason | 1–60 / 1–300 characters | `interview_models.py` |
 
 ## Boundary contracts
 

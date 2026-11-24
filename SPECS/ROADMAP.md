@@ -125,17 +125,94 @@ Status: `[~]` — offline-verified; live Telegram/Gemini verification deferred.
 - Interview completion triggers the handoff to `GENERATING`.
 
 **Acceptance criteria**
-- A full interview asks between 5 and 7 questions, one message at a time, and
+- [x] A full interview asks between 5 and 7 questions, one message at a time, and
   ends with a valid dossier.
-- Text arriving mid-interview is treated as the next answer only when a question
+- [x] Text arriving mid-interview is treated as the next answer only when a question
   is outstanding; otherwise it produces a nudge.
-- Two concurrent chats build independent dossiers with no bleed.
-- Dossier fails schema validation → one repair retry → typed error, no crash.
-- `/restart` mid-interview discards the partial dossier.
+- [x] Two concurrent chats build independent dossiers with no bleed.
+- [x] Dossier fails schema validation → one repair retry → typed error, no crash.
+- [x] `/restart` mid-interview discards the partial dossier.
 
 **Serves:** conversational state machine + structured extraction.
 
-Status: `[ ]`
+Status: `[~]` — implemented and offline-verified on `feature/2026-11-24-interviewer`;
+live Telegram/Gemini verification deferred. Not `[x]` until the verifier passes.
+
+> **Implementation note (2026-11-24, spec `SPECS/2026-11-24-interviewer/`).**
+>
+> - **Built:** the interview orchestrator (`interview.py`), the typed contracts
+>   (`interview_models.py`), the versioned session store (schema v2, `state.py`),
+>   the provider seam with bounded retry and a Gemini response schema
+>   (`interview_client.py`), the phase router (`routing.py`), copy and the dossier
+>   layout (`messages.py`), and the `/restart` command. The model is
+>   `gemini-3.1-flash-lite`, read from `config.py` only.
+> - **Flow:** a passing photo sends the first question (model-generated, empty
+>   history). Each answer is committed only after the model replies. The model may
+>   finish from 5 answers on; at 7 answers the code forces `finish`. The dossier is
+>   delivered as one text message and the chat moves to `DOSSIER_READY`.
+> - **Deliberate deviations from the wording above (approved by the Tech Lead):**
+>   1. **Pass path:** a passing photo sends the first question, not `hey mate!`. The
+>      Phase 2 confirmation is retired on the photo path. `hey mate!` remains the
+>      reply to text while awaiting a photo.
+>   2. **New phase `DOSSIER_READY`** is driven after `INTERVIEWING`, so Phase 4 can
+>      add `GENERATING` without a rewrite. `GENERATING` and `DELIVERING` are declared
+>      but not driven, so the handoff from completion to `GENERATING` is not built.
+>   3. **Dossier contents:** quirks (3 to 7, each a topic and an observation), plus
+>      one suggested animal with a short reason. The "accumulated answers" and
+>      "inferred behaviours" wording is not stored in the dossier. The answers live
+>      only in session state for the duration of the interview.
+>   4. **Length bounds (working defaults):** questions 300 characters, answers 1000,
+>      quirk topic 40, quirk observation 300, animal name 60, animal reason 300.
+>      Single line for questions, quirk text, and animal text.
+> - **Error handling:** a provider timeout, rate limit, or outage is retried at most
+>   once, then the user is asked to resend the answer (nothing is committed). An
+>   invalid reply gets one repair attempt, then the same resend message. The
+>   orchestrator enforces the 5-to-7 range; the model cannot override it.
+> - **Logging:** chat id, phase before and after, question index, and the animal's
+>   name are logged. Answers, question text, quirk text, reasons, image bytes, and
+>   keys are not.
+> - **Verified offline:** `scripts/test` and `scripts/hooks` both exit 0. The suite
+>   runs with no network and no ADK import in tests; the model is faked at the seam.
+> - **Deferred (live):** sending a portrait and receiving the first question, a full
+>   5-to-7 question run, a mid-interview photo nudge, `/restart` mid-interview, two
+>   chats interleaved, and a log check on a real run. These need real credentials.
+>   The Phase 2 live checks are also still deferred.
+> - **Confirmed by the Tech Lead (2026-11-24, requirements.md Open decisions 3, 4,
+>   7, 8):** the `DOSSIER_READY` phase (recorded in TECH.md state machine); the 300
+>   question and 1000 answer character limits (recorded in TECH.md interview limits);
+>   the shared "one at a time" copy with the Bouncer; and `/start` counting as a
+>   normal answer during an interview until Phase 7.
+
+> **Verifier note (2026-11-24, branch `feature/2026-11-24-interviewer`, uncommitted; re-verified after fixes).**
+>
+> - **Verified offline:** `scripts/test` exits 0 (364 tests; ruff check, ruff format,
+>   mypy, pytest). `scripts/hooks` exits 0 and ruff changed nothing.
+> - **Blockers from the first pass are fixed and verified:**
+>   1. **B-1, non-retryable provider errors:** HTTP 400, 401, 403, and 404 now map to
+>      `ProviderRejected` and are attempted once. A probe confirmed 1 attempt for 400
+>      and 2 for 503. The Bouncer test covers the same policy.
+>   2. **B-2, `google.genai` in a test docstring:** reworded. Zero `google.adk` or
+>      `google.genai` hits under `tests/`.
+> - **Red-first evidence (validation B):** accepted by the Tech Lead as an exception,
+>   because the work is uncommitted and no red run log was kept.
+> - **Open, which keeps `[~]`:**
+>   1. **ADK import wording (validation K): resolved.** Tech Lead chose option a: the rule
+>      is now "only the model-client modules (`vision_client.py`, `interview_client.py`)
+>      import ADK".
+>   2. **Requirements decisions 1, 2, 5, 6, 9, 10, and 11 (validation L):** not
+>      re-confirmed this round.
+>   3. **`.env` check (validation K/M):** `.env` holds two values that are not
+>      placeholder-shaped. It was not read in this run. The Tech Lead should confirm
+>      they are real credentials kept out of logs and the repo.
+> - **Live Telegram and Gemini checks: DEFERRED (validation section M, six items),**
+>   by Tech Lead instruction. No live bot run and no model call were made. No live pass
+>   is claimed.
+> - **Deliberate changes, recorded:** a passing photo sends the first question, not
+>   `hey mate!`. The chat moves to `DOSSIER_READY` after completion. `/start` counts as
+>   an answer during an interview until Phase 7.
+>
+> Status stays `[~]` because the ADK wording and the open decisions are not closed.
+> Flip to `[x]` once the Tech Lead resolves them.
 
 ---
 

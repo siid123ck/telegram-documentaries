@@ -1,8 +1,12 @@
-"""Offline tests for photo intake and routing (task group 5).
+"""Offline tests for photo intake and the photo gate.
 
 Telegram objects are plain data built locally (no ``Bot``, no network). Downloads
-and replies are injected seams and the vision client is a scripted fake, so no
-test imports the ADK, opens a socket, or reads ``.env``.
+and replies are injected seams, and the vision and interview clients are scripted
+fakes, so no test imports the ADK, opens a socket, or reads ``.env``.
+
+The pass path changed in Phase 3: a photo that passes the Bouncer now sends the
+first interview question instead of ``hey mate!``. The photo reference is stored
+only when that first question is committed.
 """
 
 from __future__ import annotations
@@ -11,17 +15,21 @@ import asyncio
 import logging
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from typing import TypeAlias
 
 import pytest
-from fakes import JPEG_BYTES, FakeVisionClient, verdict
+from fakes import (
+    JPEG_BYTES,
+    FakeInterviewClient,
+    FakeVisionClient,
+    ask,
+    verdict,
+)
 from telegram import Chat, Message, PhotoSize, Sticker, Update
 
 from telegram_documentaries import messages
 from telegram_documentaries.errors import InvalidResponse, ProviderTimeout
 from telegram_documentaries.gateway import REPLY_TEXT, build_reply
 from telegram_documentaries.messages import (
-    CONFIRMATION_TEXT,
     EMPTY_PHOTO_TEXT,
     ONE_AT_A_TIME_TEXT,
     OVERSIZE_PHOTO_TEXT,
@@ -39,6 +47,7 @@ from telegram_documentaries.state import Phase, SessionStore
 _NOW = datetime(2026, 1, 1, tzinfo=UTC)
 _CHAT = as_chat_id(4242)
 _OTHER_CHAT = as_chat_id(7777)
+FIRST_QUESTION = "Where do you sleep?"
 
 
 def _photo_size(file_id: str, file_size: int | None = 1000) -> PhotoSize:
@@ -109,21 +118,49 @@ class _RecordingSender:
         self.sent.append(text)
 
 
-_AnyDownloader: TypeAlias = "_FakeDownloader | _GatedDownloader"
+class _GatedDownloader:
+    """Holds the download open until released, so a photo can be in flight."""
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.requested: list[str] = []
+
+    async def __call__(self, file_id: str) -> bytes:
+        self.requested.append(file_id)
+        await self.release.wait()
+        return JPEG_BYTES
 
 
 def _gate(
     client: FakeVisionClient,
     *,
+    interview: FakeInterviewClient | None = None,
     store: SessionStore | None = None,
-    download: _AnyDownloader | None = None,
+    download: _FakeDownloader | _GatedDownloader | None = None,
     sender: _RecordingSender | None = None,
-) -> tuple[PhotoGate, SessionStore, _RecordingSender, _AnyDownloader]:
+) -> tuple[
+    PhotoGate,
+    SessionStore,
+    _RecordingSender,
+    _FakeDownloader | _GatedDownloader,
+    FakeInterviewClient,
+]:
     store = store if store is not None else SessionStore()
+    interview = (
+        interview
+        if interview is not None
+        else FakeInterviewClient([ask(FIRST_QUESTION)])
+    )
     fake_download = download if download is not None else _FakeDownloader()
     sender = sender if sender is not None else _RecordingSender()
-    gate = PhotoGate(client=client, store=store, download=fake_download, reply=sender)
-    return gate, store, sender, fake_download
+    gate = PhotoGate(
+        client=client,
+        interview=interview,
+        store=store,
+        download=fake_download,
+        reply=sender,
+    )
+    return gate, store, sender, fake_download, interview
 
 
 async def _until(predicate: Callable[[], bool], attempts: int = 200) -> None:
@@ -190,46 +227,54 @@ def test_parse_ignores_updates_that_are_not_routable_photos(update: Update) -> N
     assert parse_photo_update(update) is None
 
 
-# --- Happy path: pass and reject -------------------------------------------
+# --- Happy path: pass starts the interview, reject leaves the chat alone -------
 
 
-async def test_an_approved_photo_sends_the_confirmation_and_stores_the_reference() -> (
-    None
-):
+async def test_an_approved_photo_sends_the_first_question_not_hey_mate() -> None:
     client = FakeVisionClient(result=verdict(human=True))
-    gate, store, sender, download = _gate(client)
+    gate, store, sender, download, interview = _gate(client)
 
     await gate.handle(_photo_update("file-abc"))
 
-    assert sender.sent == [CONFIRMATION_TEXT] == [REPLY_TEXT]
+    assert sender.sent == [FIRST_QUESTION]
+    assert REPLY_TEXT not in sender.sent
     assert download.requested == ["file-abc"]
     assert client.calls == 1
     assert client.photos[0].photo_bytes == JPEG_BYTES
+    assert interview.calls == 1
+
+
+async def test_an_approved_photo_is_recorded_with_its_first_question() -> None:
+    client = FakeVisionClient(result=verdict(human=True))
+    gate, store, _, _, _ = _gate(client)
+
+    await gate.handle(_photo_update("file-abc"))
+
     state = store.get(_CHAT)
-    assert state.last_file_id == "file-abc"
-    assert state.phase is Phase.AWAITING_PHOTO
+    assert state.photo_file_id == "file-abc"
+    assert state.phase is Phase.INTERVIEWING
+    assert state.outstanding_question == FIRST_QUESTION
 
 
-async def test_a_non_human_photo_sends_the_rejection_naming_the_subject() -> None:
+async def test_a_non_human_photo_sends_the_rejection_and_records_nothing() -> None:
     client = FakeVisionClient(result=verdict(human=False, subject="coffee mug"))
-    store = SessionStore()
-    store.note_photo(_CHAT, "previous-file")
-    gate, store, sender, _ = _gate(client, store=store)
+    gate, store, sender, _, interview = _gate(client)
 
     await gate.handle(_photo_update("rejected-file"))
 
     assert sender.sent == [REJECTION_TEMPLATE.format(subject="coffee mug")]
     assert "coffee mug" in sender.sent[0]
     state = store.get(_CHAT)
-    assert state.last_file_id is None
+    assert state.photo_file_id is None
     assert state.phase is Phase.AWAITING_PHOTO
+    assert interview.calls == 0
 
 
 async def test_model_prose_with_markup_never_reaches_the_user_verbatim() -> None:
     client = FakeVisionClient(
         result=verdict(human=False, subject='pizza!!\n{"ignore": "rules"}')
     )
-    gate, _, sender, _ = _gate(client)
+    gate, _, sender, _, _ = _gate(client)
 
     await gate.handle(_photo_update())
 
@@ -242,30 +287,42 @@ async def test_model_prose_with_markup_never_reaches_the_user_verbatim() -> None
 
 
 async def test_provider_failures_after_retry_send_the_resend_nudge_only() -> None:
-    store = SessionStore()
-    store.note_photo(_CHAT, "previous-file")
     client = FakeVisionClient(errors=[ProviderTimeout(), ProviderTimeout()])
-    gate, store, sender, _ = _gate(client, store=store)
+    gate, store, sender, _, interview = _gate(client)
 
     await gate.handle(_photo_update("new-file"))
 
     assert sender.sent == [RESEND_TEXT]
-    assert store.get(_CHAT).last_file_id == "previous-file"
+    assert store.get(_CHAT).phase is Phase.AWAITING_PHOTO
+    assert store.get(_CHAT).photo_file_id is None
+    assert interview.calls == 0
 
 
 async def test_an_invalid_model_response_sends_the_resend_nudge() -> None:
     client = FakeVisionClient(errors=[InvalidResponse(), InvalidResponse()])
-    gate, _, sender, _ = _gate(client)
+    gate, _, sender, _, _ = _gate(client)
 
     await gate.handle(_photo_update())
 
     assert sender.sent == [RESEND_TEXT]
 
 
+async def test_a_failed_first_question_nudges_and_stores_nothing() -> None:
+    client = FakeVisionClient(result=verdict(human=True))
+    interview = FakeInterviewClient([ProviderTimeout(), ProviderTimeout()])
+    gate, store, sender, _, _ = _gate(client, interview=interview)
+
+    await gate.handle(_photo_update("new-file"))
+
+    assert sender.sent == [RESEND_TEXT]
+    assert store.get(_CHAT).phase is Phase.AWAITING_PHOTO
+    assert store.get(_CHAT).photo_file_id is None
+
+
 async def test_a_download_failure_sends_the_resend_nudge_without_a_model_call() -> None:
     client = FakeVisionClient(result=verdict())
     download = _FakeDownloader(error=ConnectionError("telegram unreachable"))
-    gate, _, sender, _ = _gate(client, download=download)
+    gate, _, sender, _, _ = _gate(client, download=download)
 
     await gate.handle(_photo_update())
 
@@ -275,7 +332,7 @@ async def test_a_download_failure_sends_the_resend_nudge_without_a_model_call() 
 
 async def test_metadata_reporting_an_oversize_photo_is_nudged_before_download() -> None:
     client = FakeVisionClient(result=verdict())
-    gate, _, sender, download = _gate(client)
+    gate, _, sender, download, _ = _gate(client)
 
     await gate.handle(_photo_update(file_size=MAX_PHOTO_BYTES + 1))
 
@@ -286,7 +343,7 @@ async def test_metadata_reporting_an_oversize_photo_is_nudged_before_download() 
 
 async def test_an_empty_download_is_nudged_and_never_sent_to_the_model() -> None:
     client = FakeVisionClient(result=verdict())
-    gate, _, sender, _ = _gate(client, download=_FakeDownloader(data=b""))
+    gate, _, sender, _, _ = _gate(client, download=_FakeDownloader(data=b""))
 
     await gate.handle(_photo_update())
 
@@ -297,7 +354,7 @@ async def test_an_empty_download_is_nudged_and_never_sent_to_the_model() -> None
 async def test_an_oversize_download_is_nudged_and_never_sent_to_the_model() -> None:
     client = FakeVisionClient(result=verdict())
     big = _FakeDownloader(data=b"x" * (MAX_PHOTO_BYTES + 1))
-    gate, _, sender, _ = _gate(client, download=big)
+    gate, _, sender, _, _ = _gate(client, download=big)
 
     await gate.handle(_photo_update(file_size=None))
 
@@ -307,7 +364,7 @@ async def test_an_oversize_download_is_nudged_and_never_sent_to_the_model() -> N
 
 async def test_non_photo_and_malformed_updates_are_ignored_quietly() -> None:
     client = FakeVisionClient(result=verdict())
-    gate, _, sender, _ = _gate(client)
+    gate, _, sender, _, _ = _gate(client)
     sticker = Sticker(
         file_id="s",
         file_unique_id="su",
@@ -344,17 +401,17 @@ async def test_non_photo_and_malformed_updates_are_ignored_quietly() -> None:
     assert client.calls == 0
 
 
-async def test_an_unexpected_handler_error_is_logged_and_the_next_update_is_served(
+async def test_an_unexpected_handler_error_is_logged_and_the_next_photo_is_served(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     client = FakeVisionClient(result=verdict(human=True), errors=[RuntimeError("boom")])
-    gate, _, sender, _ = _gate(client)
+    gate, _, sender, _, _ = _gate(client)
 
     with caplog.at_level(logging.ERROR):
         await gate.handle(_photo_update("first"))
         await gate.handle(_photo_update("second"))
 
-    assert sender.sent == [CONFIRMATION_TEXT]
+    assert sender.sent == [FIRST_QUESTION]
     assert "error_type=RuntimeError" in caplog.text
     assert any(
         record.levelno == logging.ERROR and "photo_handler_error" in record.getMessage()
@@ -370,7 +427,7 @@ async def test_a_second_photo_while_one_is_in_flight_gets_a_one_at_a_time_nudge(
 ):
     release = asyncio.Event()
     client = FakeVisionClient(result=verdict(human=True), gate=release)
-    gate, store, sender, download = _gate(client)
+    gate, store, sender, download, _ = _gate(client)
 
     first = asyncio.create_task(gate.handle(_photo_update("first", update_id=1)))
     await _until(lambda: client.calls == 1)
@@ -381,10 +438,8 @@ async def test_a_second_photo_while_one_is_in_flight_gets_a_one_at_a_time_nudge(
 
     assert client.calls == 1
     assert download.requested == ["first"]
-    assert len(sender.sent) == 2
-    assert "one at a time" in sender.sent[0].lower()
-    assert sender.sent[1] == CONFIRMATION_TEXT
-    assert store.get(_CHAT).last_file_id == "first"
+    assert sender.sent == [ONE_AT_A_TIME_TEXT, FIRST_QUESTION]
+    assert store.get(_CHAT).photo_file_id == "first"
 
 
 async def test_the_nudge_leaves_the_in_flight_rejection_unchanged() -> None:
@@ -392,9 +447,7 @@ async def test_the_nudge_leaves_the_in_flight_rejection_unchanged() -> None:
     client = FakeVisionClient(
         result=verdict(human=False, subject="pizza"), gate=release
     )
-    store = SessionStore()
-    store.note_photo(_CHAT, "previous-file")
-    gate, store, sender, _ = _gate(client, store=store)
+    gate, store, sender, _, _ = _gate(client)
 
     first = asyncio.create_task(gate.handle(_photo_update("first", update_id=1)))
     await _until(lambda: client.calls == 1)
@@ -402,16 +455,20 @@ async def test_the_nudge_leaves_the_in_flight_rejection_unchanged() -> None:
     release.set()
     await first
 
-    assert len(sender.sent) == 2
-    assert sender.sent[1] == REJECTION_TEMPLATE.format(subject="pizza")
-    assert store.get(_CHAT).last_file_id is None
+    assert sender.sent == [
+        ONE_AT_A_TIME_TEXT,
+        REJECTION_TEMPLATE.format(subject="pizza"),
+    ]
+    assert store.get(_CHAT).photo_file_id is None
     assert store.get(_CHAT).phase is Phase.AWAITING_PHOTO
 
 
-async def test_a_photo_sent_after_the_in_flight_one_finishes_is_classified() -> None:
+async def test_a_photo_after_a_rejection_is_classified_when_the_chat_is_free() -> None:
     release = asyncio.Event()
-    client = FakeVisionClient(result=verdict(human=True), gate=release)
-    gate, store, sender, _ = _gate(client)
+    client = FakeVisionClient(
+        result=verdict(human=False, subject="pizza"), gate=release
+    )
+    gate, store, sender, _, _ = _gate(client)
 
     first = asyncio.create_task(gate.handle(_photo_update("first", update_id=1)))
     await _until(lambda: client.calls == 1)
@@ -421,22 +478,22 @@ async def test_a_photo_sent_after_the_in_flight_one_finishes_is_classified() -> 
 
     await gate.handle(_photo_update("third", update_id=3))
 
+    # The third photo was classified (not nudged), so the model was called again.
     assert client.calls == 2
-    assert sender.sent[-1] == CONFIRMATION_TEXT
-    assert store.get(_CHAT).last_file_id == "third"
+    assert sender.sent[-1] == REJECTION_TEMPLATE.format(subject="pizza")
+    assert store.get(_CHAT).phase is Phase.AWAITING_PHOTO
 
 
-class _GatedDownloader:
-    """Holds the download open until released, so a photo can be in flight."""
+async def test_a_photo_once_the_interview_has_started_gets_the_nudge() -> None:
+    client = FakeVisionClient(result=verdict(human=True))
+    gate, store, sender, _, _ = _gate(client)
+    await gate.handle(_photo_update("first", update_id=1))
 
-    def __init__(self) -> None:
-        self.release = asyncio.Event()
-        self.requested: list[str] = []
+    await gate.handle(_photo_update("second", update_id=2))
 
-    async def __call__(self, file_id: str) -> bytes:
-        self.requested.append(file_id)
-        await self.release.wait()
-        return JPEG_BYTES
+    assert client.calls == 1
+    assert sender.sent[-1] == messages.PHOTO_MID_INTERVIEW_TEXT
+    assert store.get(_CHAT).photo_file_id == "first"
 
 
 async def test_a_second_photo_during_the_download_also_gets_the_nudge() -> None:
@@ -444,7 +501,7 @@ async def test_a_second_photo_during_the_download_also_gets_the_nudge() -> None:
     # while the model runs, so a photo sent mid-download is nudged too.
     client = FakeVisionClient(result=verdict(human=True))
     download = _GatedDownloader()
-    gate, _, sender, _ = _gate(client, download=download)
+    gate, _, sender, _, _ = _gate(client, download=download)
 
     first = asyncio.create_task(gate.handle(_photo_update("first", update_id=1)))
     await _until(lambda: download.requested == ["first"])
@@ -455,7 +512,7 @@ async def test_a_second_photo_during_the_download_also_gets_the_nudge() -> None:
 
     assert download.requested == ["first"]
     assert client.calls == 1
-    assert sender.sent == [ONE_AT_A_TIME_TEXT, CONFIRMATION_TEXT]
+    assert sender.sent == [ONE_AT_A_TIME_TEXT, FIRST_QUESTION]
 
 
 async def test_a_failed_first_photo_frees_the_chat_for_the_next_photo() -> None:
@@ -465,19 +522,19 @@ async def test_a_failed_first_photo_frees_the_chat_for_the_next_photo() -> None:
         result=verdict(human=True),
         errors=[ProviderTimeout(), ProviderTimeout()],
     )
-    gate, store, sender, _ = _gate(client)
+    gate, store, sender, _, _ = _gate(client)
 
     await gate.handle(_photo_update("first", update_id=1))
     await gate.handle(_photo_update("second", update_id=2))
 
-    assert sender.sent == [RESEND_TEXT, CONFIRMATION_TEXT]
+    assert sender.sent == [RESEND_TEXT, FIRST_QUESTION]
     assert client.calls == 3
-    assert store.get(_CHAT).last_file_id == "second"
+    assert store.get(_CHAT).photo_file_id == "second"
 
 
 async def test_a_cat_photo_gets_the_approved_rejection_wording() -> None:
     client = FakeVisionClient(result=verdict(human=False, subject="cat"))
-    gate, _, sender, _ = _gate(client)
+    gate, _, sender, _, _ = _gate(client)
 
     await gate.handle(_photo_update())
 
@@ -496,7 +553,7 @@ async def test_the_model_reason_is_never_shown_to_the_user() -> None:
         detected_subject="pizza",
     )
     client = FakeVisionClient(result=result)
-    gate, _, sender, _ = _gate(client)
+    gate, _, sender, _, _ = _gate(client)
 
     await gate.handle(_photo_update())
 
@@ -518,21 +575,22 @@ def test_one_at_a_time_nudge_is_short_and_free_of_internals() -> None:
 async def test_photos_from_different_chats_are_not_blocked_by_each_other() -> None:
     release = asyncio.Event()
     client = FakeVisionClient(result=verdict(human=True), gate=release)
-    gate, store, _, _ = _gate(client)
+    interview = FakeInterviewClient([ask("Chat A question?"), ask("Chat B question?")])
+    gate, store, _, _, _ = _gate(client, interview=interview)
 
     first = asyncio.create_task(
-        gate.handle(_photo_update("chat-a", chat_id=_CHAT, update_id=1))
+        gate.handle(_photo_update("chat-a", chat_id=4242, update_id=1))
     )
     await _until(lambda: client.calls == 1)
     second = asyncio.create_task(
-        gate.handle(_photo_update("chat-b", chat_id=_OTHER_CHAT, update_id=2))
+        gate.handle(_photo_update("chat-b", chat_id=7777, update_id=2))
     )
     await _until(lambda: client.calls == 2)
     release.set()
     await asyncio.gather(first, second)
 
-    assert store.get(_CHAT).last_file_id == "chat-a"
-    assert store.get(_OTHER_CHAT).last_file_id == "chat-b"
+    assert store.get(_CHAT).photo_file_id == "chat-a"
+    assert store.get(_OTHER_CHAT).photo_file_id == "chat-b"
 
 
 # --- Text routing is unchanged ----------------------------------------------

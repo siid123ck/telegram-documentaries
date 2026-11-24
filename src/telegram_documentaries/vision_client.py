@@ -19,6 +19,7 @@ from pydantic import ValidationError
 from telegram_documentaries.config import MODELS
 from telegram_documentaries.errors import (
     InvalidResponse,
+    ProviderRejected,
     ProviderTimeout,
     RateLimited,
     VisionError,
@@ -51,6 +52,10 @@ APP_NAME = "telegram-documentaries"
 #: Telegram photos arrive as JPEG unless a MIME type is supplied by the edge.
 DEFAULT_MIME_TYPE = "image/jpeg"
 
+#: HTTP statuses the provider returns for requests that will fail again unchanged.
+#: Per TECH.md these fail fast with no retry.
+NON_RETRYABLE_STATUSES: frozenset[int] = frozenset({400, 401, 403, 404})
+
 #: Errors that are safe to retry once; an invalid response is not among them.
 RETRYABLE_ERRORS: tuple[type[VisionError], ...] = (
     ProviderTimeout,
@@ -74,15 +79,28 @@ class VisionClient(Protocol):
         ...
 
 
+def _http_status(exc: BaseException) -> int | None:
+    """Return the HTTP status carried by a provider SDK error, if it has one."""
+    status = getattr(exc, "code", None)
+    return status if isinstance(status, int) else None
+
+
 def map_provider_error(exc: BaseException) -> VisionError:
     """Translate an unexpected provider exception into a typed, safe error.
 
-    Matching uses the exception *type name* and quota phrasing only. The returned
-    error carries a fixed, provider-free message, so no key, token, or payload
-    from the provider can leak into user-facing or logged text.
+    An HTTP status (400, 401, 403, 404) maps to :class:`ProviderRejected`, which is
+    never retried. Otherwise matching uses the exception *type name* and quota
+    phrasing. The returned error carries a fixed, provider-free message, so no
+    key, token, or payload from the provider can leak into user-facing or logged
+    text.
     """
     name = type(exc).__name__.lower()
     text = str(exc).lower()
+    status = _http_status(exc)
+    if status in NON_RETRYABLE_STATUSES:
+        return ProviderRejected()
+    if status == 429:
+        return RateLimited()
     if "timeout" in name or "deadline" in name:
         return ProviderTimeout()
     if "ratelimit" in name or "resourceexhausted" in name:
@@ -126,11 +144,11 @@ async def classify_with_retry(
     """Classify ``photo`` with bounded retry and safe error logging.
 
     Retryable provider failures (timeout, rate limit, temporary unavailability)
-    are retried once after a short backoff. :class:`InvalidResponse` is
-    non-retryable here and fails fast; the Bouncer stage owns the single repair
-    attempt. The final error is re-raised for the routing layer to render; only
-    safe metadata (attempt count, error type, chat id) is ever logged, never image
-    bytes or model prose.
+    are retried once after a short backoff. :class:`ProviderRejected` and
+    :class:`InvalidResponse` are non-retryable and fail fast; the Bouncer stage
+    owns the single repair attempt for an invalid response. The final error is
+    re-raised for the routing layer to render; only safe metadata (attempt count,
+    error type, chat id) is ever logged, never image bytes or model prose.
     """
     attempt = 0
     while True:
@@ -246,11 +264,10 @@ class AdkVisionClient:
         except Exception as exc:  # provider SDK failure; mapped, never leaked
             # Log only the exception class and HTTP status so the next failure is
             # diagnosable from the terminal. No message, key, or payload is logged.
-            status = getattr(exc, "code", None)
             logger.error(
                 "vision_provider_error error_type=%s provider_status=%s chat_id=%s",
                 type(exc).__name__,
-                status if isinstance(status, int) else None,
+                _http_status(exc),
                 photo.chat_id,
             )
             raise map_provider_error(exc) from exc
