@@ -37,7 +37,7 @@ def build_reply(update: Update) -> str | None:
     return REPLY_TEXT
 
 
-async def _send_reply(update: Update, text: str) -> None:
+async def send_reply(update: Update, text: str) -> None:
     """Send ``text`` back to the originating chat via the Telegram API."""
     message = update.effective_message
     if message is None:
@@ -57,13 +57,13 @@ async def handle_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     *,
-    sender: ReplySender = _send_reply,
+    sender: ReplySender = send_reply,
 ) -> None:
     """PTB callback: send the fixed reply, swallowing all errors.
 
     ``context`` is unused but required by PTB's callback signature. ``sender``
     is a thin seam that lets tests exercise the send path offline; production
-    uses :func:`_send_reply`. Errors are logged at error level and never
+    uses :func:`send_reply`. Errors are logged at error level and never
     propagated, so one bad update cannot kill the polling loop.
     """
     del context

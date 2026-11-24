@@ -12,6 +12,12 @@ from telegram_documentaries.errors import ConfigError
 ENV_FILE = ".env"
 REMEDIATION = "Set real values in .env and see .env.example."
 
+#: Single source of truth for model IDs (TECH.md). Changing a model is a one-line
+#: change here; no other module may hard-code a provider model string.
+MODELS: dict[str, str] = {
+    "bouncer": "gemini-3.1-flash-lite",
+}
+
 #: Maps the pydantic field name to the environment variable it reads.
 FIELD_TO_ENV = {
     "telegram_bot_token": "TELEGRAM_BOT_TOKEN",

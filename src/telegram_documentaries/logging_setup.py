@@ -23,6 +23,17 @@ T = TypeVar("T")
 #: setup can be called idempotently without duplicating handlers.
 _HANDLER_MARKER = "_telegram_documentaries_handler"
 
+#: Library loggers pinned to a minimum level, so they can never write the bot
+#: token into the logs. The Telegram API URL is ``/bot<TOKEN>/method``:
+#: - httpx/httpcore record every request URL at INFO.
+#: - python-telegram-bot logs the base URL (with the token) at DEBUG, so it is
+#: pinned to INFO to silence all of its DEBUG output, including endpoint payloads.
+_PINNED_LOGGER_LEVELS: dict[str, int] = {
+    "httpx": logging.WARNING,
+    "httpcore": logging.WARNING,
+    "telegram": logging.INFO,
+}
+
 #: LogRecord attribute keys that are part of the standard logging machinery and
 #: should not be re-emitted as custom key=value fields.
 _RESERVED_RECORD_KEYS = frozenset(
@@ -85,6 +96,11 @@ def configure_logging() -> None:
     root logger. The handler is marked so subsequent calls detect it and return
     early.
     """
+    # Applied on every call (not just the first) so the token guard can never be
+    # skipped; setting a level is itself idempotent.
+    for name, level in _PINNED_LOGGER_LEVELS.items():
+        logging.getLogger(name).setLevel(level)
+
     root = logging.getLogger()
     already_installed = any(
         getattr(handler, _HANDLER_MARKER, False) for handler in root.handlers

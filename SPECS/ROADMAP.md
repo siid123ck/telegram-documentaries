@@ -78,7 +78,36 @@ Status: `[x]`
 
 **Serves:** image validation + state routing.
 
-Status: `[ ]`
+Status: `[~]` — offline-verified; live Telegram/Gemini verification deferred.
+
+> **Verifier note (2026-11-24, branch `feature/2026-11-19-bouncer`, uncommitted).**
+>
+> - **Verified offline:** `scripts/test` and `scripts/hooks` both exit 0 (163
+>   tests; ruff check, ruff format, mypy, pytest all run). `scripts/test` fails on
+>   an injected unused import (`F401`) and passes with no `.env` present. The
+>   suite has no network I/O and no `google.adk` import outside `vision_client.py`.
+>   `uv sync --locked` succeeds and `google-adk` 2.14.1 is in `pyproject.toml` and
+>   `uv.lock`. `gemini-3.1-flash-lite` is defined once, in `config.py`. Photo
+>   routing, the Bouncer, typed contracts, retry bounds, state isolation, and
+>   log-content safety are covered by tests and checked against the code.
+> - **Live Telegram and Gemini verification: DEFERRED, not passed.** `.env` holds
+>   placeholder credentials only. The negative (mug/landscape) and positive
+>   (person) photo tests, the polling-started check, and the clean Ctrl-C check
+>   must be run once real `TELEGRAM_BOT_TOKEN` and `GEMINI_API_KEY` values exist.
+>   No live pass is claimed.
+> - **Approved deviations from the Phase 2 wording above:**
+>   1. **Success step:** a pass replies `hey mate!` and stays `AWAITING_PHOTO`; it
+>      does not transition to `INTERVIEWING`. The Interviewer is Phase 3.
+>   2. **Parser return type:** `parse_photo_update` returns a `PhotoRef`, not a
+>      `PhotoPayload`. The bytes are only known after the download, so the gate
+>      builds `PhotoPayload` afterwards (requirements.md, Open decisions 9).
+>   3. **Logger level:** the whole `telegram` logger is pinned to `INFO`, along
+>      with `httpx`/`httpcore` at `WARNING`, so the bot token cannot reach DEBUG
+>      logs (Open decisions 10).
+>   4. **MIME type:** images are always sent as `image/jpeg`, since Telegram photo
+>      sizes are always JPEG (Open decisions 11).
+>   5. **Second photo while one is in flight:** gets a "one at a time" nudge; it is
+>      not downloaded or classified (Open decisions 7).
 
 ---
 

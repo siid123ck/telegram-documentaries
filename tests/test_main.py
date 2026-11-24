@@ -17,10 +17,11 @@ from pathlib import Path
 
 import pytest
 from pydantic import SecretStr
+from telegram.error import InvalidToken
 from telegram.ext import Application
 
 import telegram_documentaries.app as app_module
-from telegram_documentaries import __version__
+from telegram_documentaries import __version__, logging_setup
 from telegram_documentaries.config import Settings
 from telegram_documentaries.errors import ConfigError
 
@@ -103,8 +104,56 @@ def test_valid_settings_build_the_app_and_start_polling_once(
     assert len(polled) == 1
     application = polled[0]
     assert isinstance(application, Application)
-    assert sum(len(handlers) for handlers in application.handlers.values()) == 1
+    # One text handler (Phase 1 reply) and one photo handler (Bouncer intake).
+    assert sum(len(handlers) for handlers in application.handlers.values()) == 2
     assert application.bot.token == TEST_TOKEN
+
+
+def test_the_gemini_key_is_handed_to_the_vision_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_happy_path(monkeypatch)
+    received_keys: list[str] = []
+
+    class _RecordingVisionClient:
+        def __init__(self, api_key: str) -> None:
+            received_keys.append(api_key)
+
+    monkeypatch.setattr(app_module, "AdkVisionClient", _RecordingVisionClient)
+
+    app_module.main()
+
+    assert received_keys == [TEST_KEY]
+
+
+def test_a_rejected_bot_token_exits_2_with_one_line_and_never_prints_the_token(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _patch_happy_path(monkeypatch)
+    # Use the real logging setup so the library-level guards are in effect.
+    monkeypatch.setattr(
+        app_module, "configure_logging", logging_setup.configure_logging
+    )
+
+    def reject_token(application: object) -> None:
+        # PTB embeds the raw token in this message; it must never reach output.
+        raise InvalidToken(f"The token `{TEST_TOKEN}` was rejected by the server.")
+
+    monkeypatch.setattr(app_module, "_run_polling", reject_token)
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(SystemExit) as excinfo:
+        app_module.main()
+
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert TEST_TOKEN not in captured.out
+    assert TEST_TOKEN not in captured.err
+    assert TEST_TOKEN not in caplog.text
+    assert "Traceback" not in captured.err
+    assert captured.err.count("\n") == 1
+    assert "TELEGRAM_BOT_TOKEN" in captured.err
 
 
 def test_startup_logs_polling_started_version_and_source_without_secrets(

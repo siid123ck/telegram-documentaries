@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import logging
 
+import httpx
 import pytest
 from pydantic import SecretStr
+from telegram.ext import Application
 
 from telegram_documentaries.config import Settings
 from telegram_documentaries.logging_setup import configure_logging, log_stage
@@ -143,3 +145,58 @@ def test_log_stage_logs_exception_type_and_reraises(
         for message in error_messages
     )
     assert "Traceback" not in caplog.text
+
+
+# --- Bot token never reaches the logs ------------------------------------------
+
+#: A well-formed but fake Telegram-style token. It is never a real credential.
+FAKE_BOT_TOKEN = "123456:FAKE-TOKEN-FOR-TESTS-ONLY"
+
+
+def test_httpx_request_urls_carrying_the_bot_token_are_not_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    configure_logging()
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"ok": True, "result": {}})
+    )
+
+    with (
+        caplog.at_level(logging.INFO),
+        httpx.Client(transport=transport) as client,
+    ):
+        client.get(f"https://api.telegram.org/bot{FAKE_BOT_TOKEN}/getMe")
+
+    assert FAKE_BOT_TOKEN not in caplog.text
+    assert "HTTP Request" not in caplog.text
+
+
+@pytest.mark.parametrize("logger_name", ["httpx", "httpcore"])
+def test_http_client_loggers_are_pinned_to_warning(logger_name: str) -> None:
+    configure_logging()
+
+    logger = logging.getLogger(logger_name)
+
+    assert not logger.isEnabledFor(logging.INFO)
+    assert logger.isEnabledFor(logging.WARNING)
+
+
+def test_ptb_debug_logs_never_show_the_bot_token(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # PTB logs "Set Bot API URL: https://api.telegram.org/bot<TOKEN>" at DEBUG.
+    # Even when debugging is turned up, that token must not reach the log.
+    configure_logging()
+
+    with caplog.at_level(logging.DEBUG):
+        Application.builder().token(FAKE_BOT_TOKEN).build()
+
+    assert FAKE_BOT_TOKEN not in caplog.text
+
+
+@pytest.mark.parametrize("logger_name", ["telegram"])
+def test_python_telegram_bot_loggers_are_pinned_to_info(logger_name: str) -> None:
+    configure_logging()
+
+    assert not logging.getLogger(logger_name).isEnabledFor(logging.DEBUG)
+    assert logging.getLogger(logger_name).isEnabledFor(logging.INFO)
