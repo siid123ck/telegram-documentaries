@@ -15,6 +15,7 @@ import pytest
 import telegram_documentaries.app as app_module
 from telegram_documentaries.generation import telegram_text_sender
 from telegram_documentaries.models import as_chat_id
+from telegram_documentaries.narrator_client import GeminiNarrationClient
 from telegram_documentaries.routing import UpdateRouter
 from telegram_documentaries.scripter_client import AdkScriptClient
 
@@ -45,6 +46,23 @@ def test_the_router_is_wired_with_the_script_client_and_a_text_sender(
 
     assert isinstance(captured["scripts"], AdkScriptClient)
     assert callable(captured["send_text"])
+
+
+def test_the_router_is_wired_with_the_narration_client_and_a_voice_sender(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def spy(**kwargs: Any) -> UpdateRouter:
+        captured.update(kwargs)
+        return UpdateRouter(**kwargs)
+
+    monkeypatch.setattr(app_module, "UpdateRouter", spy)
+
+    app_module._build_application(TEST_TOKEN, TEST_KEY)
+
+    assert isinstance(captured["narrator"], GeminiNarrationClient)
+    assert callable(captured["send_voice"])
 
 
 class _FakeTextBot:

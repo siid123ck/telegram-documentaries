@@ -91,6 +91,14 @@ SCRIPT_FAILED_TEXT = (
     "send /restart for a new subject."
 )
 
+#: Sent when narration (synthesis, encoding, or the voice send) fails. The script
+#: text is already in the chat. It carries no code, error type, provider wording,
+#: or stack trace (N15).
+NARRATION_UNAVAILABLE_TEXT = (
+    "Narration is unavailable for this run. Your portrait and script stand; "
+    "send /restart for a new subject."
+)
+
 #: Second caption line. Fixed copy, not per-animal and never model prose (D16).
 CAPTION_SECOND_LINE = "Filmed in its natural habitat, unaware it is being watched."
 

@@ -132,3 +132,15 @@ Respond with nothing except one strict JSON object, with no markdown fence and
 no extra keys, matching exactly this shape:
 {"script": "your single paragraph"}
 """
+
+#: Instruction for the Narrator (TTS). It sets the voice and delivery of the voice
+#: note (N8). The script text is sent after it as the content. The prompt asks for
+#: speech only: it has no caption or Telegram wording, and it never receives the
+#: dossier, the photo, or the answers.
+NARRATOR_INSTRUCTION = """\
+For this narration, you speak with a posh British accent, in a deep male voice.
+Deliver the text as a hushed, measured nature documentary narration in the style
+of David Attenborough: calm, grave, and quietly amused, as if observing a rare and
+curious animal. Pause naturally between sentences. Read the text that follows
+exactly as written.
+"""

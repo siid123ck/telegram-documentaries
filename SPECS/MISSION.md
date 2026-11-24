@@ -28,8 +28,9 @@ observed behaviour. The user is the subject, not the viewer.
    portrait and returns it to the chat as an image.
 6. **Scripter** writes one paragraph (~60–90 words) of dramatic narration from
    the dossier.
-7. **Narrator** renders that script with Gemini TTS and delivers it as an
-   OGG/Opus Telegram voice note.
+7. **Narrator** renders that script with Gemini TTS and delivers it as an MP3
+   Telegram voice note. (The roadmap said OGG/Opus. MP3 is a recorded deviation:
+   Telegram's `sendVoice` accepts MP3.)
 
 ## In scope
 

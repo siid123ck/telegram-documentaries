@@ -1,4 +1,4 @@
-"""Tests for the versioned per-chat session store (schema v4).
+"""Tests for the versioned per-chat session store (schema v5).
 
 :class:`SessionStore` is the only writer of session fields. Stages go through
 its named methods and never mutate a :class:`SessionState`. These tests pin the
@@ -74,8 +74,8 @@ def test_a_fresh_chat_starts_awaiting_a_photo_with_nothing_recorded() -> None:
     assert state.in_flight is False
 
 
-def test_the_schema_version_is_four() -> None:
-    assert STATE_VERSION == 4
+def test_the_schema_version_is_five() -> None:
+    assert STATE_VERSION == 5
 
 
 def test_every_declared_phase_keeps_its_wire_value() -> None:
@@ -1067,3 +1067,252 @@ def test_two_chats_keep_independent_scripts_and_a_reset_leaves_the_other_intact(
     assert store.get(_CHAT_A).script is None
     assert store.get(_CHAT_B).script == "Script for B."
     assert store.get(_CHAT_B).phase is Phase.DELIVERING
+
+
+# --- Phase 6: session v5 and the narration driver methods (N9 to N11) ----------
+
+
+def _narration_ready(store: SessionStore, chat_id: ChatId = _CHAT_A) -> int:
+    """Drive a chat to DELIVERING with a stored script and nothing in flight.
+
+    Returns the epoch the narration step would capture at its start.
+    """
+    _delivering_and_settled(store, chat_id)
+    epoch = store.epoch(chat_id)
+    assert store.begin_script(chat_id, epoch) is True
+    assert store.commit_script(chat_id, epoch, _SCRIPT) is True
+    return epoch
+
+
+def test_a_stored_schema_version_four_is_discarded_on_read() -> None:
+    stale = SessionState(
+        schema_version=4,
+        phase=Phase.DELIVERING,
+        photo_file_id="old-photo",
+        dossier=_dossier(),
+        script=_SCRIPT,
+    )
+    store = SessionStore(initial={_CHAT_A: stale})
+
+    state = store.get(_CHAT_A)
+
+    assert state.schema_version == STATE_VERSION
+    assert state.phase is Phase.AWAITING_PHOTO
+    assert state.script is None
+    assert state.narration_started is False
+
+
+def test_a_new_session_has_not_started_narration() -> None:
+    assert SessionStore().get(_CHAT_A).narration_started is False
+
+
+def test_begin_narration_from_delivering_with_a_script_starts_one_run() -> None:
+    store = SessionStore()
+    epoch = _narration_ready(store)
+
+    started = store.begin_narration(_CHAT_A, epoch)
+
+    assert started is True
+    state = store.get(_CHAT_A)
+    assert state.phase is Phase.DELIVERING
+    assert state.script == _SCRIPT
+    assert state.narration_started is True
+    assert state.in_flight is True
+    _assert_invariants(store, 1001)
+
+
+def test_a_second_begin_narration_in_the_same_run_is_refused() -> None:
+    store = SessionStore()
+    epoch = _narration_ready(store)
+    assert store.begin_narration(_CHAT_A, epoch) is True
+    before = store.get(_CHAT_A)
+
+    assert store.begin_narration(_CHAT_A, epoch) is False
+    assert store.get(_CHAT_A) == before
+
+
+def test_a_begin_narration_after_a_failed_run_is_refused() -> None:
+    store = SessionStore()
+    epoch = _narration_ready(store)
+    assert store.begin_narration(_CHAT_A, epoch) is True
+    assert store.end_narration(_CHAT_A, epoch) is True  # the run failed
+    before = store.get(_CHAT_A)
+
+    assert store.begin_narration(_CHAT_A, epoch) is False
+    assert store.get(_CHAT_A) == before
+    assert store.get(_CHAT_A).narration_started is True
+
+
+def test_begin_narration_while_a_turn_is_in_flight_is_refused() -> None:
+    store = SessionStore()
+    epoch = _narration_ready(store)
+    store.begin_turn(_CHAT_A)
+    before = store.get(_CHAT_A)
+
+    assert store.begin_narration(_CHAT_A, epoch) is False
+    assert store.get(_CHAT_A) == before
+
+
+def test_begin_narration_without_a_script_is_refused() -> None:
+    store = SessionStore()
+    _delivering_and_settled(store)
+    epoch = store.epoch(_CHAT_A)
+    before = store.get(_CHAT_A)
+
+    assert store.begin_narration(_CHAT_A, epoch) is False
+    assert store.get(_CHAT_A) == before
+
+
+def test_begin_narration_with_a_stale_epoch_changes_nothing() -> None:
+    store = SessionStore()
+    stale_epoch = _narration_ready(store)
+    store.reset(_CHAT_A)
+    _delivering_and_settled(store)
+    epoch = store.epoch(_CHAT_A)
+    assert store.begin_script(_CHAT_A, epoch) is True
+    assert store.commit_script(_CHAT_A, epoch, "A newer script.") is True
+    before = store.get(_CHAT_A)
+
+    assert store.begin_narration(_CHAT_A, stale_epoch) is False
+    assert store.get(_CHAT_A) == before
+    assert store.get(_CHAT_A).narration_started is False
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        SessionState(phase=Phase.IDLE),
+        SessionState(phase=Phase.AWAITING_PHOTO),
+        SessionState(phase=Phase.INTERVIEWING),
+        SessionState(phase=Phase.DOSSIER_READY, dossier=_dossier()),
+        SessionState(phase=Phase.GENERATING, dossier=_dossier(), generation_run="run"),
+    ],
+    ids=lambda state: state.phase.value,
+)
+def test_begin_narration_outside_delivering_changes_nothing(
+    state: SessionState,
+) -> None:
+    store = SessionStore(initial={_CHAT_A: state})
+
+    assert store.begin_narration(_CHAT_A, store.epoch(_CHAT_A)) is False
+    assert store.get(_CHAT_A) == state
+
+
+def test_end_narration_clears_in_flight_and_keeps_narration_started() -> None:
+    store = SessionStore()
+    epoch = _narration_ready(store)
+    store.begin_narration(_CHAT_A, epoch)
+
+    ended = store.end_narration(_CHAT_A, epoch)
+
+    assert ended is True
+    state = store.get(_CHAT_A)
+    assert state.in_flight is False
+    assert state.narration_started is True
+    assert state.script == _SCRIPT
+    assert state.phase is Phase.DELIVERING
+    _assert_invariants(store, 1001)
+
+
+def test_end_narration_with_a_stale_epoch_changes_nothing() -> None:
+    store = SessionStore()
+    epoch = _narration_ready(store)
+    store.begin_narration(_CHAT_A, epoch)
+    store.reset(_CHAT_A)
+    _delivering_and_settled(store)
+    before = store.get(_CHAT_A)
+
+    assert store.end_narration(_CHAT_A, epoch) is False
+    assert store.get(_CHAT_A) == before
+
+
+def test_end_narration_with_a_stale_epoch_cannot_clear_a_newer_turn() -> None:
+    store = SessionStore()
+    old_epoch = _narration_ready(store)
+    store.begin_narration(_CHAT_A, old_epoch)
+    store.reset(_CHAT_A)
+    new_epoch = _narration_ready(store)
+    assert store.begin_narration(_CHAT_A, new_epoch) is True
+
+    assert store.end_narration(_CHAT_A, old_epoch) is False
+    assert store.get(_CHAT_A).in_flight is True
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        SessionState(phase=Phase.DELIVERING, narration_started=True),
+        SessionState(phase=Phase.DELIVERING, script=None, narration_started=True),
+        SessionState(
+            phase=Phase.DOSSIER_READY, dossier=_dossier(), narration_started=True
+        ),
+        SessionState(
+            phase=Phase.GENERATING,
+            dossier=_dossier(),
+            generation_run="run",
+            narration_started=True,
+        ),
+    ],
+    ids=[
+        "delivering-without-script",
+        "delivering-script-unset",
+        "dossier-ready",
+        "generating",
+    ],
+)
+def test_narration_started_outside_delivering_with_a_script_is_refused(
+    state: SessionState,
+) -> None:
+    store = SessionStore(initial={_CHAT_A: state})
+
+    with pytest.raises(StateError):
+        store.release_turn(_CHAT_A)
+
+
+def test_reset_clears_narration_started_from_every_phase() -> None:
+    for phase in Phase:
+        messy = SessionState(
+            phase=phase,
+            photo_file_id="photo",
+            answers=[_EXCHANGE],
+            outstanding_question=_QUESTION if phase is Phase.INTERVIEWING else None,
+            dossier=_dossier() if phase in _DOSSIER_PHASES else None,
+            generation_run="run" if phase is Phase.GENERATING else None,
+            in_flight=True,
+            script=_SCRIPT if phase is Phase.DELIVERING else None,
+            narration_started=phase is Phase.DELIVERING,
+        )
+        store = SessionStore(initial={_CHAT_A: messy})
+
+        store.reset(_CHAT_A)
+
+        state = store.get(_CHAT_A)
+        assert state.phase is Phase.AWAITING_PHOTO, phase
+        assert state.narration_started is False, phase
+        assert state.in_flight is False, phase
+
+
+def test_two_chats_keep_independent_narration_runs() -> None:
+    store = SessionStore()
+    epoch_a = _narration_ready(store, _CHAT_A)
+    epoch_b = _narration_ready(store, _CHAT_B)
+    assert store.begin_narration(_CHAT_A, epoch_a) is True
+
+    assert store.get(_CHAT_A).narration_started is True
+    assert store.get(_CHAT_B).narration_started is False
+    assert store.begin_narration(_CHAT_B, epoch_b) is True
+
+
+def test_resetting_one_chat_clears_only_its_narration_flag() -> None:
+    store = SessionStore()
+    epoch_a = _narration_ready(store, _CHAT_A)
+    epoch_b = _narration_ready(store, _CHAT_B)
+    store.begin_narration(_CHAT_A, epoch_a)
+    store.begin_narration(_CHAT_B, epoch_b)
+
+    store.reset(_CHAT_A)
+
+    assert store.get(_CHAT_A).narration_started is False
+    assert store.get(_CHAT_B).narration_started is True
+    assert store.get(_CHAT_B).phase is Phase.DELIVERING
+    assert store.get(_CHAT_B).script == _SCRIPT

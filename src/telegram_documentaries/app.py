@@ -33,6 +33,8 @@ from telegram_documentaries.generation import (
 )
 from telegram_documentaries.interview_client import AdkInterviewClient
 from telegram_documentaries.logging_setup import configure_logging
+from telegram_documentaries.narrator_client import GeminiNarrationClient
+from telegram_documentaries.narrator_sender import telegram_voice_sender
 from telegram_documentaries.photo_handler import telegram_downloader
 from telegram_documentaries.routing import UpdateRouter
 from telegram_documentaries.scripter_client import AdkScriptClient
@@ -83,6 +85,8 @@ def _build_application(token: str, gemini_api_key: str) -> TelegramApplication:
         send_photo=telegram_photo_sender(application.bot),
         scripts=AdkScriptClient(api_key=gemini_api_key),
         send_text=telegram_text_sender(application.bot),
+        narrator=GeminiNarrationClient(api_key=gemini_api_key),
+        send_voice=telegram_voice_sender(application.bot),
     )
     restart_cb = _update_callback(router.handle_restart)
     text_cb = _update_callback(router.handle_text)

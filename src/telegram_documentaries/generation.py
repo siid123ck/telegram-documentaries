@@ -26,11 +26,16 @@ from telegram_documentaries.interview_models import Dossier
 from telegram_documentaries.logging_setup import log_stage
 from telegram_documentaries.messages import (
     GENERATION_FAILED_TEXT,
+    NARRATION_UNAVAILABLE_TEXT,
     ONE_AT_A_TIME_TEXT,
     SCRIPT_FAILED_TEXT,
     render_caption,
 )
 from telegram_documentaries.models import ChatId
+from telegram_documentaries.narrator import generate_narration
+from telegram_documentaries.narrator_audio import encode_mp3
+from telegram_documentaries.narrator_client import NarrationClient
+from telegram_documentaries.narrator_sender import VoiceSender
 from telegram_documentaries.photo_handler import Downloader
 from telegram_documentaries.scripter import generate_script
 from telegram_documentaries.scripter_client import ScriptClient
@@ -193,6 +198,72 @@ async def _run_script_step(
         await _send_script_apology(chat_id, send_text)
 
 
+async def _send_narration_unavailable(chat_id: ChatId, send_text: TextSender) -> None:
+    """Send the fixed narration-unavailable note. Best effort; it carries no detail."""
+    try:
+        await send_text(chat_id, NARRATION_UNAVAILABLE_TEXT)
+    except Exception as exc:  # the note itself is best effort
+        logger.error(
+            "narration_apology_failed error_type=%s chat_id=%s",
+            type(exc).__name__,
+            chat_id,
+        )
+
+
+async def _run_narration_step(
+    chat_id: ChatId,
+    store: SessionStore,
+    epoch: int,
+    narrator: NarrationClient,
+    send_voice: VoiceSender,
+    send_text: TextSender,
+) -> None:
+    """Narrate the stored script as one voice note, after the script text.
+
+    Runs in ``DELIVERING`` with the script text already in the chat.
+    ``begin_narration`` allows exactly one run per delivery, so a duplicate update or
+    a retry never starts a second synthesis. The epoch is the run's own, so a
+    ``/restart`` at any point drops the late result with no send. Every failure sends
+    the narration-unavailable note once and keeps the script. ``in_flight`` is cleared
+    in ``finally``.
+    """
+    script = store.get(chat_id).script
+    if script is None or not store.begin_narration(chat_id, epoch):
+        logger.info("narration_dropped reason=not_started chat_id=%s", chat_id)
+        return
+
+    def still_current() -> bool:
+        # The paid-call guard: no synthesis attempt starts after a reset.
+        return store.epoch(chat_id) == epoch
+
+    try:
+        voice = await generate_narration(
+            script, narrator, still_current=still_current, encode=encode_mp3
+        )
+        # No await between this check and the send, so a reset cannot land in between.
+        if store.epoch(chat_id) != epoch:
+            logger.info("narration_dropped reason=stale_run chat_id=%s", chat_id)
+            return
+        await send_voice(chat_id, voice)
+        logger.info(
+            "narration_delivered chat_id=%s mp3_bytes=%d", chat_id, len(voice.mp3)
+        )
+    except Exception as exc:  # a narration failure is recoverable for the user
+        if store.epoch(chat_id) != epoch:
+            logger.info("narration_dropped reason=stale_run chat_id=%s", chat_id)
+            return
+        # Only the error type is logged; the message may carry provider text.
+        logger.error(
+            "narration_failed error_type=%s chat_id=%s",
+            type(exc).__name__,
+            chat_id,
+        )
+        await _send_narration_unavailable(chat_id, send_text)
+    finally:
+        # Stale epochs change nothing here, so this is safe after a reset.
+        store.end_narration(chat_id, epoch)
+
+
 async def _generate_and_deliver(
     chat_id: ChatId,
     run: str,
@@ -203,6 +274,8 @@ async def _generate_and_deliver(
     outcome: _RunOutcome,
     scripts: ScriptClient | None = None,
     send_text: TextSender | None = None,
+    narrator: NarrationClient | None = None,
+    send_voice: VoiceSender | None = None,
 ) -> str | None:
     """Run the steps of one generation, in order, for a run that has started."""
     state = store.get(chat_id)
@@ -292,6 +365,12 @@ async def _generate_and_deliver(
     # in-flight guard covers the gap between the portrait and the script.
     if scripts is not None and send_text is not None:
         await _run_script_step(chat_id, store, dossier, scripts, send_text)
+    # The narration step follows the script step with no await in between (the
+    # Phase 6 flow). It reuses this run's epoch, so a reset anywhere drops it.
+    if narrator is not None and send_voice is not None and send_text is not None:
+        await _run_narration_step(
+            chat_id, store, epoch, narrator, send_voice, send_text
+        )
     return None
 
 
@@ -304,6 +383,8 @@ async def _run_once(
     outcome: _RunOutcome,
     scripts: ScriptClient | None = None,
     send_text: TextSender | None = None,
+    narrator: NarrationClient | None = None,
+    send_voice: VoiceSender | None = None,
 ) -> str | None:
     """Start a run, refuse a duplicate, and always abandon the run at the end."""
     run = store.begin_generation(chat_id)
@@ -320,6 +401,8 @@ async def _run_once(
             outcome,
             scripts,
             send_text,
+            narrator,
+            send_voice,
         )
     finally:
         # A no-op once the run has moved on (delivered, or reset by /restart).
@@ -356,6 +439,8 @@ async def run_generation(
     *,
     scripts: ScriptClient | None = None,
     send_text: TextSender | None = None,
+    narrator: NarrationClient | None = None,
+    send_voice: VoiceSender | None = None,
 ) -> str | None:
     """Generate and deliver the portrait for a chat that has finished its dossier.
 
@@ -380,6 +465,8 @@ async def run_generation(
             outcome,
             scripts,
             send_text,
+            narrator,
+            send_voice,
         )
     except Exception as exc:
         outcome.error_type = type(exc).__name__

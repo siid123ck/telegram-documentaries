@@ -16,12 +16,19 @@ REMEDIATION = "Set real values in .env and see .env.example."
 #: change here; no other module may hard-code a provider model string.
 _FLASH_LITE = "gemini-3.1-flash-lite"
 _IMAGE = "gemini-3.1-flash-image"
+_TTS = "gemini-3.1-flash-tts-preview"
 MODELS: dict[str, str] = {
     "bouncer": _FLASH_LITE,
     "interviewer": _FLASH_LITE,
     "scripter": _FLASH_LITE,
     "converter": _IMAGE,
+    "narrator": _TTS,
 }
+
+#: The Gemini prebuilt speech voice for the Narrator (requirements N7). It is set
+#: here only; logic reads this constant. Provisional: the Tech Lead confirms it
+#: after a live audition (Open decision 3).
+NARRATOR_VOICE = "Charon"
 
 #: Maps the pydantic field name to the environment variable it reads.
 FIELD_TO_ENV = {

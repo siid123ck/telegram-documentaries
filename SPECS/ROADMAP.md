@@ -330,21 +330,44 @@ Status: `[ ]`
 
 - Script is sent to Gemini TTS at
   `gemini-3.1-flash-tts-preview`.
-- Output converted to OGG/Opus and delivered via `sendVoice` as a voice note.
+- Output converted to MP3 (not OGG/Opus, a recorded deviation) and delivered via
+  `sendVoice` as a voice note.
 - TTS failure falls back to delivering the script as plain text so the run is
   not lost.
 - Exactly one synthesis per successful run.
 
 **Acceptance criteria**
 - A completed run ends with a playable voice note in the chat.
-- The voice note is OGG/Opus and plays inline in Telegram.
+- The voice note is MP3 (deviation from OGG/Opus, recorded) and plays inline in Telegram.
 - TTS failure still delivers the script text and logs at error level.
 - No duplicate synthesis when a duplicate update arrives during delivery.
 - Temp audio removed after send.
 
 **Serves:** TTS tool integration + audio delivery.
 
-Status: `[ ]`
+Status: `[~]` — implemented on `feature/2026-11-24-narrator` (uncommitted); offline checks green (`scripts/test` and `scripts/hooks` exit 0, 986 tests); live Telegram/Gemini verification deferred. Kept at `[~]`: V-4, V-5, and V-6 are open (see the re-check below). Not `[x]` until they close.
+
+> **Verifier note (2026-11-24, verifier pass, `SPECS/2026-11-24-narrator/validation.md`).**
+>
+> - **Delivered:** portrait, then script text, then one MP3 voice note (`sendVoice`, no
+>   caption). Narration runs once per run, in `DELIVERING`, with `narration_started`
+>   (STATE_VERSION 5). Max 2 synthesis attempts, 30 s each. A temp file in the system
+>   temp dir is removed after the send. Fallback copy `NARRATION_UNAVAILABLE_TEXT`.
+>   Encoder: `lameenc`, the one new dependency (N3, approval open).
+> - **Deviation, recorded:** MP3, not OGG/Opus. Telegram accepts MP3 for voice notes.
+>   The ROADMAP, MISSION, and TECH wording is amended to MP3.
+> - **Re-check (2026-11-24, offline, after the fixes):** V-1 (logging, sentinel test) and
+>   V-2 (only one real encode test) are fixed. V-3 is fixed for duplicate during
+>   `send_voice`, `/restart` between encode and send, cross-chat narration, and a fresh
+>   interview after restart. Still untested at the routing level: a sticker, voice note,
+>   or document after narration (`app.py` registers only TEXT and PHOTO handlers).
+> - **Open items:** V-4 (no red-run record; N3 and N1 to N18 Tech Lead approval), V-5
+>   (no group 0 spike record; MIME and sample rate unconfirmed live), V-6 (voice
+>   `Charon` provisional).
+> - **Deferred (live, validation section N):** send order on a real chat, inline
+>   playback, the voice sample, the reply format on a real call, `/restart` during a real
+>   synthesis, duplicate-call count, forced provider failure, real-run logs, and temp
+>   directory after a real run.
 
 ---
 

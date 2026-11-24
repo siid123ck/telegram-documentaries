@@ -27,6 +27,8 @@ from telegram_documentaries.messages import (
     RESEND_ANSWER_TEXT,
 )
 from telegram_documentaries.models import ChatId, as_chat_id
+from telegram_documentaries.narrator_client import NarrationClient
+from telegram_documentaries.narrator_sender import VoiceSender
 from telegram_documentaries.photo_handler import Downloader, PhotoGate
 from telegram_documentaries.scripter_client import ScriptClient
 from telegram_documentaries.state import Phase, SessionStore
@@ -61,6 +63,8 @@ class UpdateRouter:
         reply: ReplySender = send_reply,
         scripts: ScriptClient | None = None,
         send_text: TextSender | None = None,
+        narrator: NarrationClient | None = None,
+        send_voice: VoiceSender | None = None,
     ) -> None:
         self._interview = interview
         self._store = store
@@ -70,6 +74,8 @@ class UpdateRouter:
         self._send_photo = send_photo
         self._scripts = scripts
         self._send_text = send_text
+        self._narrator = narrator
+        self._send_voice = send_voice
         self._photos = PhotoGate(
             client=vision,
             interview=interview,
@@ -96,6 +102,8 @@ class UpdateRouter:
             self._send_photo,
             scripts=self._scripts,
             send_text=self._send_text,
+            narrator=self._narrator,
+            send_voice=self._send_voice,
         )
         if text is not None:
             await self._reply(update, text)
