@@ -44,6 +44,16 @@ class RateLimited(VisionError):
         super().__init__(message)
 
 
+class ProviderRejected(VisionError):
+    """The vision provider rejected the request (HTTP 400, 401, 403, or 404).
+
+    Non-retryable: the same request would fail again, so it fails fast.
+    """
+
+    def __init__(self, message: str = "vision provider rejected the request") -> None:
+        super().__init__(message)
+
+
 class InvalidResponse(VisionError):
     """The vision provider returned data that failed contract validation.
 

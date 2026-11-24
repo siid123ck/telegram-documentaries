@@ -7,9 +7,12 @@ cannot miss because of a string-vs-int mismatch.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
+import telegram_documentaries.config as config_module
 from telegram_documentaries.config import MODELS
 from telegram_documentaries.models import (
     MAX_PHOTO_BYTES,
@@ -177,3 +180,13 @@ def test_photo_payload_normalises_a_string_chat_id() -> None:
 
 def test_bouncer_model_id_is_single_sourced_in_config() -> None:
     assert MODELS["bouncer"] == "gemini-3.1-flash-lite"
+
+
+def test_interviewer_reads_its_model_from_the_same_mapping_as_the_bouncer() -> None:
+    assert MODELS["interviewer"] == "gemini-3.1-flash-lite"
+
+
+def test_the_flash_lite_model_literal_appears_exactly_once_in_config() -> None:
+    config_source = Path(config_module.__file__).read_text(encoding="utf-8")
+
+    assert config_source.count("gemini-3.1-flash-lite") == 1

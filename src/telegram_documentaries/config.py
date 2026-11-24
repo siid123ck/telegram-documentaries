@@ -14,8 +14,10 @@ REMEDIATION = "Set real values in .env and see .env.example."
 
 #: Single source of truth for model IDs (TECH.md). Changing a model is a one-line
 #: change here; no other module may hard-code a provider model string.
+_FLASH_LITE = "gemini-3.1-flash-lite"
 MODELS: dict[str, str] = {
-    "bouncer": "gemini-3.1-flash-lite",
+    "bouncer": _FLASH_LITE,
+    "interviewer": _FLASH_LITE,
 }
 
 #: Maps the pydantic field name to the environment variable it reads.

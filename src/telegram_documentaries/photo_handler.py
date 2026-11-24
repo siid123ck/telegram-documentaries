@@ -2,9 +2,15 @@
 
 The pure :func:`parse_photo_update` turns a raw update into a :class:`PhotoRef`
 (largest photo size, typed ``ChatId``) without touching the network. The
-:class:`PhotoGate` runs the Bouncer for one photo, renders exactly one reply, and
-never lets an exception escape to the polling loop. Downloading and replying are
-injected seams, so tests stay offline.
+:class:`PhotoGate` handles a photo according to the chat's phase:
+
+- ``AWAITING_PHOTO``: the Bouncer classifies it. A pass starts the interview and
+  sends the first question; a fail sends the in-character rejection.
+- ``INTERVIEWING`` or ``DOSSIER_READY``: a nudge, with no download and no
+  Bouncer call.
+
+It never lets an exception escape to the polling loop. Downloading and replying
+are injected seams, so tests stay offline.
 """
 
 from __future__ import annotations
@@ -20,12 +26,15 @@ from telegram import PhotoSize, Update
 from telegram_documentaries.bouncer import inspect as bouncer_inspect
 from telegram_documentaries.errors import VisionError
 from telegram_documentaries.gateway import ReplySender, send_reply
+from telegram_documentaries.interview import start_interview
+from telegram_documentaries.interview_client import InterviewClient
 from telegram_documentaries.logging_setup import log_stage
 from telegram_documentaries.messages import (
-    CONFIRMATION_TEXT,
+    ALREADY_DONE_TEXT,
     EMPTY_PHOTO_TEXT,
     ONE_AT_A_TIME_TEXT,
     OVERSIZE_PHOTO_TEXT,
+    PHOTO_MID_INTERVIEW_TEXT,
     REJECTION_TEMPLATE,
     RESEND_TEXT,
     render_subject,
@@ -36,7 +45,7 @@ from telegram_documentaries.models import (
     PhotoPayload,
     as_chat_id,
 )
-from telegram_documentaries.state import SessionStore
+from telegram_documentaries.state import Phase, SessionStore
 from telegram_documentaries.vision_client import VisionClient
 
 logger = logging.getLogger(__name__)
@@ -107,27 +116,39 @@ def telegram_downloader(bot: TelegramFileSource) -> Downloader:
     return download
 
 
-class PhotoGate:
-    """Run the Bouncer for one photo update and send exactly one reply.
+#: Nudge for a photo in a phase that already has a photo or a dossier.
+_PHOTO_NUDGE_BY_PHASE = {
+    Phase.INTERVIEWING: (PHOTO_MID_INTERVIEW_TEXT, "mid_interview"),
+}
 
-    At most one classification runs per chat at a time. A second photo that
-    arrives while the first is in flight gets a "one at a time" nudge instead;
-    it is never downloaded or classified, so it cannot corrupt that chat's state.
+
+class PhotoGate:
+    """Route one photo update by phase and send exactly one reply.
+
+    A chat is busy while a photo is being handled or a model call is in flight.
+    Any photo that arrives then gets a "one at a time" nudge; it is never
+    downloaded or classified, so it cannot corrupt that chat's state.
     """
 
     def __init__(
         self,
         *,
         client: VisionClient,
+        interview: InterviewClient,
         store: SessionStore,
         download: Downloader,
         reply: ReplySender = send_reply,
     ) -> None:
         self._client = client
+        self._interview = interview
         self._store = store
         self._download = download
         self._reply = reply
         self._in_flight: set[ChatId] = set()
+
+    def is_busy(self, chat_id: ChatId) -> bool:
+        """Whether a photo or a model call is already in progress for ``chat_id``."""
+        return chat_id in self._in_flight or self._store.get(chat_id).in_flight
 
     @log_stage
     async def handle(self, update: Update) -> None:
@@ -137,9 +158,9 @@ class PhotoGate:
             logger.debug("photo_update_ignored reason=not_a_routable_photo")
             return
         try:
-            if ref.chat_id in self._in_flight:
-                # Answered without a download or a model call, so the photo
-                # already in flight is unaffected.
+            if self.is_busy(ref.chat_id):
+                # Answered without a download or a model call, so whatever is
+                # already in flight for this chat is unaffected.
                 await self._nudge(update, ref, ONE_AT_A_TIME_TEXT, "in_flight")
                 return
             self._in_flight.add(ref.chat_id)
@@ -155,7 +176,15 @@ class PhotoGate:
             )
 
     async def _process(self, update: Update, ref: PhotoRef) -> None:
-        """Fetch, validate, classify, and reply for one routable photo."""
+        """Route one routable photo by the chat's phase, then reply once."""
+        phase = self._store.get(ref.chat_id).phase
+        if phase is not Phase.AWAITING_PHOTO:
+            text, reason = _PHOTO_NUDGE_BY_PHASE.get(
+                phase, (ALREADY_DONE_TEXT, "already_done")
+            )
+            await self._nudge(update, ref, text, reason)
+            return
+
         if ref.file_size is not None and ref.file_size > MAX_PHOTO_BYTES:
             await self._nudge(update, ref, OVERSIZE_PHOTO_TEXT, "oversize")
             return
@@ -186,19 +215,23 @@ class PhotoGate:
             return
 
         try:
-            verdict = await bouncer_inspect(photo, self._client, self._store)
+            verdict = await bouncer_inspect(photo, self._client)
+            if not verdict.contains_human:
+                text = REJECTION_TEMPLATE.format(
+                    subject=render_subject(verdict.detected_subject)
+                )
+                await self._reply(update, text)
+                return
+            # The photo is recorded only when its first question is committed.
+            started = await start_interview(
+                ref.chat_id, ref.file_id, self._interview, self._store
+            )
         except VisionError:
-            # The vision stage already logged the typed error; state is untouched.
+            # The failing stage already logged the typed error; state is untouched.
             await self._nudge(update, ref, RESEND_TEXT, "vision_error")
             return
 
-        if verdict.contains_human:
-            await self._reply(update, CONFIRMATION_TEXT)
-        else:
-            text = REJECTION_TEMPLATE.format(
-                subject=render_subject(verdict.detected_subject)
-            )
-            await self._reply(update, text)
+        await self._reply(update, started.text)
 
     async def _nudge(
         self, update: Update, ref: PhotoRef, text: str, reason: str

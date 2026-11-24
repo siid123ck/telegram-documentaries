@@ -17,6 +17,7 @@ import telegram_documentaries.messages as messages_module
 from telegram_documentaries import bouncer
 from telegram_documentaries.errors import (
     InvalidResponse,
+    ProviderRejected,
     ProviderTimeout,
     RateLimited,
     VisionError,
@@ -24,7 +25,7 @@ from telegram_documentaries.errors import (
 )
 from telegram_documentaries.gateway import REPLY_TEXT
 from telegram_documentaries.messages import (
-    CONFIRMATION_TEXT,
+    HEY_MATE,
     REJECTION_TEMPLATE,
     RESEND_TEXT,
     render_subject,
@@ -35,7 +36,6 @@ from telegram_documentaries.models import (
     VisionVerdict,
     as_chat_id,
 )
-from telegram_documentaries.state import Phase, SessionStore
 
 _CHAT = as_chat_id(4242)
 _OTHER = as_chat_id(7777)
@@ -45,74 +45,71 @@ def _photo(chat: ChatId = _CHAT, file_id: str = "file-1") -> PhotoPayload:
     return PhotoPayload(chat_id=chat, file_id=file_id, photo_bytes=JPEG_BYTES)
 
 
-# --- Verdict routing (pass / fail) -----------------------------------------
+# --- Verdicts (the Bouncer returns a verdict and touches no session state) ----
 
 
-async def test_a_human_verdict_is_returned_and_the_photo_reference_is_stored() -> None:
-    store = SessionStore()
+async def test_a_human_verdict_is_returned_unchanged() -> None:
     client = FakeVisionClient(result=verdict(human=True, subject="person"))
 
-    result = await bouncer.inspect(_photo(file_id="file-abc"), client, store)
+    result = await bouncer.inspect(_photo(file_id="file-abc"), client)
 
     assert result.contains_human is True
-    state = store.get(_CHAT)
-    assert state.last_file_id == "file-abc"
-    assert state.phase is Phase.AWAITING_PHOTO
+    assert result.detected_subject == "person"
+    assert client.photos[0].file_id == "file-abc"
 
 
 @pytest.mark.parametrize("subject", ["cat", "pizza", "car", "coffee mug", "landscape"])
-async def test_a_non_human_verdict_resets_the_chat_to_awaiting_photo(
+async def test_a_non_human_verdict_is_returned_for_the_routing_layer_to_render(
     subject: str,
 ) -> None:
-    store = SessionStore()
-    store.note_photo(_CHAT, "previous-file")
     client = FakeVisionClient(result=verdict(human=False, subject=subject))
 
-    result = await bouncer.inspect(_photo(file_id="rejected-file"), client, store)
+    result = await bouncer.inspect(_photo(file_id="rejected-file"), client)
 
     assert result.contains_human is False
     assert result.detected_subject == subject
-    state = store.get(_CHAT)
-    assert state.last_file_id is None
-    assert state.phase is Phase.AWAITING_PHOTO
 
 
 # --- Provider failure paths ------------------------------------------------
 
 
-async def test_a_timeout_after_retry_raises_and_leaves_the_chat_untouched() -> None:
-    store = SessionStore()
-    store.note_photo(_CHAT, "previous-file")
+async def test_a_timeout_after_retry_is_raised_to_the_caller() -> None:
     client = FakeVisionClient(errors=[ProviderTimeout(), ProviderTimeout()])
 
     with pytest.raises(ProviderTimeout):
-        await bouncer.inspect(_photo(file_id="new-file"), client, store)
+        await bouncer.inspect(_photo(file_id="new-file"), client)
 
-    assert store.get(_CHAT).last_file_id == "previous-file"
+    assert client.calls == 2
+
+
+async def test_a_provider_rejection_is_raised_after_one_attempt() -> None:
+    client = FakeVisionClient(errors=[ProviderRejected(), ProviderRejected()])
+
+    with pytest.raises(ProviderRejected):
+        await bouncer.inspect(_photo(file_id="new-file"), client)
+
+    assert client.calls == 1
 
 
 @pytest.mark.parametrize("error_type", [VisionUnavailable, RateLimited])
-async def test_other_retryable_failures_after_retry_leave_the_chat_untouched(
+async def test_other_retryable_failures_after_retry_are_raised(
     error_type: type[VisionError],
 ) -> None:
-    store = SessionStore()
-    store.note_photo(_CHAT, "previous-file")
     client = FakeVisionClient(errors=[error_type(), error_type()])
 
     with pytest.raises(error_type):
-        await bouncer.inspect(_photo(file_id="new-file"), client, store)
+        await bouncer.inspect(_photo(file_id="new-file"), client)
 
-    assert store.get(_CHAT).last_file_id == "previous-file"
+    assert client.calls == 2
 
 
 async def test_an_invalid_response_gets_one_repair_with_the_validation_detail() -> None:
-    store = SessionStore()
     client = FakeVisionClient(
         errors=[InvalidResponse(detail="contains_human: Field required")],
         result=verdict(human=True),
     )
 
-    result = await bouncer.inspect(_photo(file_id="file-ok"), client, store)
+    result = await bouncer.inspect(_photo(file_id="file-ok"), client)
 
     assert result.contains_human is True
     assert client.calls == 2
@@ -120,36 +117,15 @@ async def test_an_invalid_response_gets_one_repair_with_the_validation_detail() 
     repair_note = client.repair_notes[1]
     assert repair_note is not None
     assert "contains_human: Field required" in repair_note
-    assert store.get(_CHAT).last_file_id == "file-ok"
 
 
 async def test_an_invalid_response_twice_raises_after_exactly_one_repair() -> None:
-    store = SessionStore()
-    store.note_photo(_CHAT, "previous-file")
     client = FakeVisionClient(errors=[InvalidResponse(), InvalidResponse()])
 
     with pytest.raises(InvalidResponse):
-        await bouncer.inspect(_photo(file_id="new-file"), client, store)
+        await bouncer.inspect(_photo(file_id="new-file"), client)
 
     assert client.calls == 2
-    assert store.get(_CHAT).last_file_id == "previous-file"
-
-
-# --- Cross-chat isolation ----------------------------------------------------
-
-
-async def test_one_chat_passing_and_another_rejecting_never_bleed_into_each_other() -> (
-    None
-):
-    store = SessionStore()
-    passing = FakeVisionClient(result=verdict(human=True))
-    rejecting = FakeVisionClient(result=verdict(human=False, subject="cat"))
-
-    await bouncer.inspect(_photo(chat=_CHAT, file_id="chat-a-file"), passing, store)
-    await bouncer.inspect(_photo(chat=_OTHER, file_id="chat-b-file"), rejecting, store)
-
-    assert store.get(_CHAT).last_file_id == "chat-a-file"
-    assert store.get(_OTHER).last_file_id is None
 
 
 # --- Logging safety ----------------------------------------------------------
@@ -158,7 +134,6 @@ async def test_one_chat_passing_and_another_rejecting_never_bleed_into_each_othe
 async def test_the_stage_logs_chat_verdict_and_subject_but_never_bytes_or_prose(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    store = SessionStore()
     client = FakeVisionClient(
         result=VisionVerdict(
             contains_human=False,
@@ -170,7 +145,7 @@ async def test_the_stage_logs_chat_verdict_and_subject_but_never_bytes_or_prose(
     photo = PhotoPayload(chat_id=_CHAT, file_id="f", photo_bytes=raw_marker)
 
     with caplog.at_level(logging.INFO):
-        await bouncer.inspect(photo, client, store)
+        await bouncer.inspect(photo, client)
 
     text = caplog.text
     assert "chat_id=4242" in text
@@ -187,7 +162,7 @@ async def test_the_stage_records_entry_outcome_and_duration(
     client = FakeVisionClient(result=verdict(human=True))
 
     with caplog.at_level(logging.INFO):
-        await bouncer.inspect(_photo(), client, SessionStore())
+        await bouncer.inspect(_photo(), client)
 
     assert "stage_start stage=inspect" in caplog.text
     assert "stage_end stage=inspect outcome=ok" in caplog.text
@@ -231,8 +206,8 @@ def test_invalid_response_detail_defaults_to_empty() -> None:
 # --- Single-sourced copy -----------------------------------------------------
 
 
-def test_confirmation_text_aliases_the_phase_one_constant() -> None:
-    assert CONFIRMATION_TEXT == REPLY_TEXT
+def test_hey_mate_aliases_the_phase_one_constant() -> None:
+    assert HEY_MATE == REPLY_TEXT
 
 
 def test_messages_module_does_not_duplicate_the_fixed_literal() -> None:

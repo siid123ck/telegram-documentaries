@@ -15,13 +15,13 @@ import pytest
 from telegram_documentaries import bouncer
 from telegram_documentaries.errors import (
     InvalidResponse,
+    ProviderRejected,
     ProviderTimeout,
     RateLimited,
     VisionError,
     VisionUnavailable,
 )
 from telegram_documentaries.models import PhotoPayload, VisionVerdict, as_chat_id
-from telegram_documentaries.state import SessionStore
 from telegram_documentaries.vision_client import (
     VisionClient,
     classify_with_retry,
@@ -88,9 +88,8 @@ async def test_inspect_forwards_the_exact_photo_and_returns_the_verdict() -> Non
     photo = _photo()
     verdict = _verdict()
     client = _CountingVisionClient(verdict=verdict)
-    store = SessionStore()
 
-    result = await bouncer.inspect(photo, client, store)
+    result = await bouncer.inspect(photo, client)
 
     assert len(client.calls) == 1
     assert client.calls[0] is photo
@@ -239,7 +238,7 @@ def test_local_validation_still_rejects_extra_keys_after_schema_relaxation() -> 
 
 
 class ClientError(Exception):
-    """Stand-in for ``google.genai.errors.ClientError`` (same name, has ``code``)."""
+    """Stand-in for the provider SDK's client error (same name, carries ``code``)."""
 
     def __init__(self, code: int, message: str) -> None:
         super().__init__(message)
@@ -261,7 +260,7 @@ async def test_provider_failure_logs_underlying_class_and_status_without_secrets
 
     with (
         caplog.at_level(logging.ERROR, logger="telegram_documentaries"),
-        pytest.raises(VisionUnavailable),
+        pytest.raises(ProviderRejected),
     ):
         await client.classify(_photo())
 
@@ -272,3 +271,59 @@ async def test_provider_failure_logs_underlying_class_and_status_without_secrets
     assert "provider_status=400" in provider_lines[0]
     assert all(secret not in m for m in messages)
     assert all(b"\xff\xd8" not in m.encode() for m in messages)
+
+
+# --- Non-retryable provider statuses (400, 401, 403, 404) fail fast -----------
+
+
+class ServerError(Exception):
+    """Stand-in for the provider SDK's server error (same name, carries ``code``)."""
+
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404])
+def test_non_retryable_client_statuses_map_to_provider_rejected(status: int) -> None:
+    mapped = map_provider_error(ClientError(status, "rejected"))
+
+    assert type(mapped) is ProviderRejected
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (ClientError(429, "slow down"), RateLimited),
+        (ServerError(500, "internal"), VisionUnavailable),
+        (ServerError(503, "unavailable"), VisionUnavailable),
+    ],
+)
+def test_retryable_statuses_keep_their_retryable_mapping(
+    error: Exception, expected: type[VisionError]
+) -> None:
+    mapped = map_provider_error(error)
+
+    assert type(mapped) is expected
+
+
+async def test_a_provider_rejection_is_attempted_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from telegram_documentaries.vision_client import AdkVisionClient
+
+    client = AdkVisionClient(api_key="test-key-not-used-offline")
+    attempts = 0
+
+    async def rejected_run(*_args: object) -> VisionVerdict:
+        nonlocal attempts
+        attempts += 1
+        raise ClientError(400, "INVALID_ARGUMENT")
+
+    monkeypatch.setattr(client, "_run_agent", rejected_run)
+
+    with pytest.raises(ProviderRejected):
+        await classify_with_retry(client, _photo())
+
+    # TECH.md: non-retryable errors fail fast. No second provider call.
+    assert attempts == 1

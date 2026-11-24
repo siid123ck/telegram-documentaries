@@ -10,9 +10,37 @@ from __future__ import annotations
 import re
 
 from telegram_documentaries.gateway import REPLY_TEXT
+from telegram_documentaries.interview_models import MAX_ANSWER_CHARS, Dossier
 
-#: Pass-path confirmation (aliased, never duplicated).
-CONFIRMATION_TEXT = REPLY_TEXT
+#: Text sent while the chat is awaiting a photo (Phase 1 reply, never duplicated).
+HEY_MATE = REPLY_TEXT
+
+#: Opening prompt sent after ``/restart``.
+OPENING_PROMPT = "Send me a portrait photo to begin your documentary."
+
+#: Nudge for a photo sent mid-interview; the Bouncer is not called.
+PHOTO_MID_INTERVIEW_TEXT = (
+    "I'm still mid-expedition with you — please answer the question above."
+)
+
+#: Sent after a provider failure on an answer; the answer is not committed.
+RESEND_ANSWER_TEXT = "Signal's fuzzy — mind resending your last answer?"
+
+#: Nudges for answers that are blank or over the length limit.
+EMPTY_ANSWER_TEXT = "I didn't catch anything there — tell me a little more."
+ANSWER_TOO_LONG_TEXT = (
+    f"That's a lot to observe in one go — keep it under {MAX_ANSWER_CHARS} characters."
+)
+
+#: Sent for any text or photo after the dossier is complete.
+ALREADY_DONE_TEXT = "Your dossier is complete. Send /restart for a new subject."
+
+#: Defensive nudge for text that arrives with no question outstanding. Should
+#: not happen in normal flow; it is logged at warning level.
+NO_QUESTION_TEXT = "I'm not expecting an answer just now — send /restart to start over."
+
+#: First line of every dossier message.
+DOSSIER_HEADER = "Field notes complete. Here is your dossier:"
 
 #: Cheeky in-character rejection; ``subject`` is the model's plain object name.
 REJECTION_TEMPLATE = (
@@ -49,3 +77,18 @@ def render_subject(raw: str) -> str:
     plain = " ".join(_UNSAFE_SUBJECT_CHARS.sub(" ", raw).split())
     capped = plain[:MAX_SUBJECT_CHARS].rstrip()
     return capped or FALLBACK_SUBJECT
+
+
+def render_dossier(dossier: Dossier) -> str:
+    """Render the finished dossier as one plain-text message.
+
+    Only the validated :class:`Dossier` fields are drawn on: one line per quirk,
+    then the suggested animal and its reason. No model prose is passed through
+    unvalidated, and no other field exists to render.
+    """
+    lines = [DOSSIER_HEADER, ""]
+    lines.extend(f"- {quirk.topic}: {quirk.observation}" for quirk in dossier.quirks)
+    lines.append("")
+    lines.append(f"Suggested animal: {dossier.suggested_animal.name}")
+    lines.append(f"Why: {dossier.suggested_animal.reason}")
+    return "\n".join(lines)
