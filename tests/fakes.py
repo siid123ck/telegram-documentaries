@@ -279,3 +279,38 @@ class RecordingPhotoSender:
         if self._error is not None:
             raise self._error
         self.sent.append((chat_id, image_bytes, caption))
+
+
+class FakeScriptClient:
+    """Scripted ``ScriptClient``: each call pops the next reply or raises the error.
+
+    ``gate``, when supplied, holds every call open until it is set, so a test can
+    reset the chat while the model is working. Every call records the repair note
+    it was given; the stage never sends the rejected text back.
+    """
+
+    def __init__(
+        self,
+        script: Sequence[str | Exception],
+        *,
+        gate: asyncio.Event | None = None,
+    ) -> None:
+        self._script = list(script)
+        self._gate = gate
+        self.repair_notes: list[str | None] = []
+
+    @property
+    def calls(self) -> int:
+        """Number of times the provider was asked for a script."""
+        return len(self.repair_notes)
+
+    async def write(self, dossier: Dossier, *, repair_note: str | None = None) -> str:
+        self.repair_notes.append(repair_note)
+        if self._gate is not None:
+            await self._gate.wait()
+        if not self._script:
+            raise AssertionError("FakeScriptClient ran out of scripted replies")
+        item = self._script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item

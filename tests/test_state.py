@@ -1,4 +1,4 @@
-"""Tests for the versioned per-chat session store (schema v3).
+"""Tests for the versioned per-chat session store (schema v4).
 
 :class:`SessionStore` is the only writer of session fields. Stages go through
 its named methods and never mutate a :class:`SessionState`. These tests pin the
@@ -74,8 +74,8 @@ def test_a_fresh_chat_starts_awaiting_a_photo_with_nothing_recorded() -> None:
     assert state.in_flight is False
 
 
-def test_the_schema_version_is_three() -> None:
-    assert STATE_VERSION == 3
+def test_the_schema_version_is_four() -> None:
+    assert STATE_VERSION == 4
 
 
 def test_every_declared_phase_keeps_its_wire_value() -> None:
@@ -761,3 +761,309 @@ def test_a_result_with_no_intervening_reset_is_current() -> None:
     store.require_current(_CHAT_A, epoch)
 
     assert store.get(_CHAT_A).phase is Phase.INTERVIEWING
+
+
+# --- Phase 5: session v4 and the script driver methods (S4 to S6) --------------
+
+_SCRIPT = "A short narration paragraph about the badger."
+
+
+def _delivering_and_settled(store: SessionStore, chat_id: ChatId = _CHAT_A) -> None:
+    """Drive a finished portrait through to DELIVERING with ``in_flight`` cleared.
+
+    This is the point at which the script step may begin (S3).
+    """
+    _ready_for_generation(store, chat_id)
+    run = store.begin_generation(chat_id)
+    assert run is not None
+    assert store.begin_delivery(chat_id, run) is True
+    assert store.finish_delivery(chat_id) is True
+
+
+def test_a_stored_schema_version_three_is_discarded_on_read() -> None:
+    stale = SessionState(
+        schema_version=3,
+        phase=Phase.DELIVERING,
+        photo_file_id="old-photo",
+        answers=[_EXCHANGE],
+        dossier=_dossier(),
+    )
+    store = SessionStore(initial={_CHAT_A: stale})
+
+    state = store.get(_CHAT_A)
+
+    assert state.schema_version == STATE_VERSION
+    assert state.phase is Phase.AWAITING_PHOTO
+    assert state.dossier is None
+    assert state.script is None
+
+
+def test_a_new_session_has_no_script() -> None:
+    assert SessionStore().get(_CHAT_A).script is None
+
+
+def test_begin_script_from_delivering_sets_in_flight_and_stores_nothing_yet() -> None:
+    store = SessionStore()
+    _delivering_and_settled(store)
+    epoch = store.epoch(_CHAT_A)
+
+    started = store.begin_script(_CHAT_A, epoch)
+
+    assert started is True
+    state = store.get(_CHAT_A)
+    assert state.phase is Phase.DELIVERING
+    assert state.in_flight is True
+    assert state.script is None
+    assert state.dossier == _dossier()
+    _assert_invariants(store, 1001)
+
+
+def test_begin_script_while_the_portrait_is_still_sending_is_refused() -> None:
+    store = SessionStore()
+    _ready_for_generation(store)
+    run = store.begin_generation(_CHAT_A)
+    assert run is not None
+    store.begin_delivery(_CHAT_A, run)
+    before = store.get(_CHAT_A)
+
+    started = store.begin_script(_CHAT_A, store.epoch(_CHAT_A))
+
+    assert started is False
+    assert store.get(_CHAT_A) == before
+
+
+def test_a_second_begin_script_while_in_flight_is_refused() -> None:
+    store = SessionStore()
+    _delivering_and_settled(store)
+    epoch = store.epoch(_CHAT_A)
+    assert store.begin_script(_CHAT_A, epoch) is True
+    before = store.get(_CHAT_A)
+
+    assert store.begin_script(_CHAT_A, epoch) is False
+    assert store.get(_CHAT_A) == before
+
+
+def test_begin_script_after_a_script_is_stored_is_refused() -> None:
+    store = SessionStore()
+    _delivering_and_settled(store)
+    epoch = store.epoch(_CHAT_A)
+    store.begin_script(_CHAT_A, epoch)
+    store.commit_script(_CHAT_A, epoch, _SCRIPT)
+    before = store.get(_CHAT_A)
+
+    assert store.begin_script(_CHAT_A, epoch) is False
+    assert store.get(_CHAT_A) == before
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        SessionState(phase=Phase.IDLE),
+        SessionState(phase=Phase.AWAITING_PHOTO),
+        SessionState(phase=Phase.INTERVIEWING),
+        SessionState(phase=Phase.DOSSIER_READY, dossier=_dossier()),
+        SessionState(phase=Phase.GENERATING, dossier=_dossier(), generation_run="run"),
+    ],
+    ids=lambda state: state.phase.value,
+)
+def test_begin_script_outside_delivering_changes_nothing(state: SessionState) -> None:
+    store = SessionStore(initial={_CHAT_A: state})
+
+    started = store.begin_script(_CHAT_A, store.epoch(_CHAT_A))
+
+    assert started is False
+    assert store.get(_CHAT_A) == state
+
+
+def test_begin_script_with_a_stale_epoch_changes_nothing() -> None:
+    store = SessionStore()
+    stale_epoch = store.epoch(_CHAT_A)
+    store.reset(_CHAT_A)
+    _delivering_and_settled(store)
+    before = store.get(_CHAT_A)
+
+    started = store.begin_script(_CHAT_A, stale_epoch)
+
+    assert started is False
+    assert store.get(_CHAT_A) == before
+
+
+def test_commit_script_stores_the_text_and_clears_in_flight() -> None:
+    store = SessionStore()
+    _delivering_and_settled(store)
+    epoch = store.epoch(_CHAT_A)
+    store.begin_script(_CHAT_A, epoch)
+
+    committed = store.commit_script(_CHAT_A, epoch, _SCRIPT)
+
+    assert committed is True
+    state = store.get(_CHAT_A)
+    assert state.phase is Phase.DELIVERING
+    assert state.script == _SCRIPT
+    assert state.in_flight is False
+    assert state.dossier == _dossier()
+    _assert_invariants(store, 1001)
+
+
+def test_commit_script_without_a_begin_is_refused() -> None:
+    store = SessionStore()
+    _delivering_and_settled(store)
+    before = store.get(_CHAT_A)
+
+    committed = store.commit_script(_CHAT_A, store.epoch(_CHAT_A), _SCRIPT)
+
+    assert committed is False
+    assert store.get(_CHAT_A) == before
+
+
+def test_commit_script_outside_delivering_changes_nothing() -> None:
+    store = SessionStore()
+    _ready_for_generation(store)
+    run = store.begin_generation(_CHAT_A)
+    assert run is not None
+    before = store.get(_CHAT_A)
+
+    committed = store.commit_script(_CHAT_A, store.epoch(_CHAT_A), _SCRIPT)
+
+    assert committed is False
+    assert store.get(_CHAT_A) == before
+
+
+def test_a_late_commit_from_before_a_reset_cannot_change_a_newer_script_step() -> None:
+    store = SessionStore()
+    _delivering_and_settled(store)
+    old_epoch = store.epoch(_CHAT_A)
+    assert store.begin_script(_CHAT_A, old_epoch) is True
+
+    store.reset(_CHAT_A)
+    _delivering_and_settled(store)
+    new_epoch = store.epoch(_CHAT_A)
+    assert store.begin_script(_CHAT_A, new_epoch) is True
+    before = store.get(_CHAT_A)
+
+    committed = store.commit_script(_CHAT_A, old_epoch, _SCRIPT)
+
+    assert committed is False
+    assert store.get(_CHAT_A) == before
+    assert store.get(_CHAT_A).script is None
+    assert store.get(_CHAT_A).in_flight is True
+
+
+def test_abandon_script_clears_in_flight_and_keeps_the_script_absent() -> None:
+    store = SessionStore()
+    _delivering_and_settled(store)
+    epoch = store.epoch(_CHAT_A)
+    store.begin_script(_CHAT_A, epoch)
+
+    abandoned = store.abandon_script(_CHAT_A, epoch)
+
+    assert abandoned is True
+    state = store.get(_CHAT_A)
+    assert state.phase is Phase.DELIVERING
+    assert state.in_flight is False
+    assert state.script is None
+    assert state.dossier == _dossier()
+
+
+def test_an_abandoned_script_step_can_be_begun_again() -> None:
+    store = SessionStore()
+    _delivering_and_settled(store)
+    epoch = store.epoch(_CHAT_A)
+    store.begin_script(_CHAT_A, epoch)
+    store.abandon_script(_CHAT_A, epoch)
+
+    assert store.begin_script(_CHAT_A, epoch) is True
+
+
+def test_abandon_script_with_a_stale_epoch_changes_nothing() -> None:
+    store = SessionStore()
+    _delivering_and_settled(store)
+    old_epoch = store.epoch(_CHAT_A)
+    store.begin_script(_CHAT_A, old_epoch)
+    store.reset(_CHAT_A)
+    _delivering_and_settled(store)
+    store.begin_script(_CHAT_A, store.epoch(_CHAT_A))
+    before = store.get(_CHAT_A)
+
+    abandoned = store.abandon_script(_CHAT_A, old_epoch)
+
+    assert abandoned is False
+    assert store.get(_CHAT_A) == before
+    assert store.get(_CHAT_A).in_flight is True
+
+
+def test_abandon_script_outside_delivering_changes_nothing() -> None:
+    store = SessionStore()
+    _start_interview(store, _CHAT_A)
+    store.begin_turn(_CHAT_A)
+    before = store.get(_CHAT_A)
+
+    abandoned = store.abandon_script(_CHAT_A, store.epoch(_CHAT_A))
+
+    assert abandoned is False
+    assert store.get(_CHAT_A) == before
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        SessionState(phase=Phase.IDLE, script=_SCRIPT),
+        SessionState(phase=Phase.AWAITING_PHOTO, script=_SCRIPT),
+        SessionState(phase=Phase.INTERVIEWING, script=_SCRIPT),
+        SessionState(phase=Phase.DOSSIER_READY, dossier=_dossier(), script=_SCRIPT),
+        SessionState(
+            phase=Phase.GENERATING,
+            dossier=_dossier(),
+            generation_run="run",
+            script=_SCRIPT,
+        ),
+    ],
+    ids=lambda state: state.phase.value,
+)
+def test_a_script_outside_delivering_is_refused_at_the_next_commit(
+    state: SessionState,
+) -> None:
+    store = SessionStore(initial={_CHAT_A: state})
+
+    with pytest.raises(StateError):
+        store.release_turn(_CHAT_A)
+
+
+@pytest.mark.parametrize("phase", list(Phase), ids=lambda phase: phase.value)
+def test_reset_from_every_phase_clears_the_script_and_in_flight(phase: Phase) -> None:
+    messy = SessionState(
+        phase=phase,
+        photo_file_id="photo",
+        answers=[_EXCHANGE],
+        outstanding_question=_QUESTION if phase is Phase.INTERVIEWING else None,
+        dossier=_dossier() if phase in _DOSSIER_PHASES else None,
+        generation_run="run" if phase is Phase.GENERATING else None,
+        in_flight=True,
+        script=_SCRIPT if phase is Phase.DELIVERING else None,
+    )
+    store = SessionStore(initial={_CHAT_A: messy})
+
+    store.reset(_CHAT_A)
+
+    state = store.get(_CHAT_A)
+    assert state.phase is Phase.AWAITING_PHOTO
+    assert state.script is None
+    assert state.in_flight is False
+
+
+def test_two_chats_keep_independent_scripts_and_a_reset_leaves_the_other_intact() -> (
+    None
+):
+    store = SessionStore()
+    _delivering_and_settled(store, _CHAT_A)
+    _delivering_and_settled(store, _CHAT_B)
+    for chat_id, text in ((_CHAT_A, "Script for A."), (_CHAT_B, "Script for B.")):
+        epoch = store.epoch(chat_id)
+        assert store.begin_script(chat_id, epoch) is True
+        assert store.commit_script(chat_id, epoch, text) is True
+
+    store.reset(_CHAT_A)
+
+    assert store.get(_CHAT_A).script is None
+    assert store.get(_CHAT_B).script == "Script for B."
+    assert store.get(_CHAT_B).phase is Phase.DELIVERING

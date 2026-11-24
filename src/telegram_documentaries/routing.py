@@ -18,7 +18,7 @@ from telegram import Update
 from telegram_documentaries.converter_client import PortraitClient
 from telegram_documentaries.errors import StaleResult, VisionError
 from telegram_documentaries.gateway import ReplySender, build_reply, send_reply
-from telegram_documentaries.generation import PhotoSender, run_generation
+from telegram_documentaries.generation import PhotoSender, TextSender, run_generation
 from telegram_documentaries.interview import answer_question, restart
 from telegram_documentaries.interview_client import InterviewClient
 from telegram_documentaries.messages import (
@@ -28,6 +28,7 @@ from telegram_documentaries.messages import (
 )
 from telegram_documentaries.models import ChatId, as_chat_id
 from telegram_documentaries.photo_handler import Downloader, PhotoGate
+from telegram_documentaries.scripter_client import ScriptClient
 from telegram_documentaries.state import Phase, SessionStore
 from telegram_documentaries.vision_client import VisionClient
 
@@ -58,6 +59,8 @@ class UpdateRouter:
         portraits: PortraitClient,
         send_photo: PhotoSender,
         reply: ReplySender = send_reply,
+        scripts: ScriptClient | None = None,
+        send_text: TextSender | None = None,
     ) -> None:
         self._interview = interview
         self._store = store
@@ -65,6 +68,8 @@ class UpdateRouter:
         self._reply = reply
         self._portraits = portraits
         self._send_photo = send_photo
+        self._scripts = scripts
+        self._send_text = send_text
         self._photos = PhotoGate(
             client=vision,
             interview=interview,
@@ -84,7 +89,13 @@ class UpdateRouter:
         here: the portrait itself is the reply when it is delivered.
         """
         text = await run_generation(
-            chat_id, self._store, self._download, self._portraits, self._send_photo
+            chat_id,
+            self._store,
+            self._download,
+            self._portraits,
+            self._send_photo,
+            scripts=self._scripts,
+            send_text=self._send_text,
         )
         if text is not None:
             await self._reply(update, text)

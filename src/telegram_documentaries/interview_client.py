@@ -40,6 +40,7 @@ from telegram_documentaries.vision_client import (
     RETRY_BACKOFF_SECONDS,
     map_provider_error,
 )
+from telegram_documentaries.wire_schema import flatten_wire_schema
 
 if TYPE_CHECKING:  # annotations only; never imported at runtime
     from google.adk.runners import Runner
@@ -106,58 +107,14 @@ def build_turn_request(history: Sequence[Answer], note: str | None) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _flatten_schema(node: Any, defs: dict[str, Any]) -> Any:
-    """Inline ``$ref`` and convert nullable unions into Gemini-compatible form.
-
-    Pydantic emits ``$defs`` references, ``additionalProperties``, and
-    ``{"type": "null"}`` branches. The Gemini response schema accepts none of
-    them, so they are rewritten here for the wire only. The strict local check
-    (:class:`InterviewTurn`) still runs on every reply.
-    """
-    if isinstance(node, list):
-        return [_flatten_schema(item, defs) for item in node]
-    if not isinstance(node, dict):
-        return node
-    if "$ref" in node:
-        return _flatten_schema(defs[node["$ref"].rsplit("/", 1)[-1]], defs)
-    branches = node.get("anyOf")
-    if isinstance(branches, list) and {"type": "null"} in branches:
-        non_null = [branch for branch in branches if branch != {"type": "null"}]
-        if len(non_null) == 1:
-            merged = {key: value for key, value in node.items() if key != "anyOf"}
-            merged.update(_flatten_schema(non_null[0], defs))
-            merged["nullable"] = True
-            return _drop_wire_noise(merged)
-    return _flatten_schema_object(node, defs)
-
-
-def _drop_wire_noise(node: dict[str, Any]) -> dict[str, Any]:
-    """Remove keys Gemini does not accept, such as defaults and the null type."""
-    return {key: value for key, value in node.items() if key != "default"}
-
-
-def _flatten_schema_object(
-    node: dict[str, Any], defs: dict[str, Any]
-) -> dict[str, Any]:
-    flattened: dict[str, Any] = {}
-    for key, value in _drop_wire_noise(node).items():
-        if key == "additionalProperties":
-            continue
-        flattened[key] = _flatten_schema(value, defs)
-    return flattened
-
-
 def interview_response_schema() -> dict[str, Any]:
     """Return the JSON schema sent to Gemini as the interviewer's response schema.
 
     Every top-level key is marked required (optional values are nullable), so the
-    model always emits the full ``action`` / ``question`` / ``dossier`` shape.
+    model always emits the full ``action`` / ``question`` / ``dossier`` shape. The
+    flattening rules are shared with the Scripter (see :mod:`wire_schema`).
     """
-    raw = InterviewTurn.model_json_schema()
-    defs: dict[str, Any] = raw.pop("$defs", {})
-    schema: dict[str, Any] = _flatten_schema(raw, defs)
-    schema["required"] = list(schema["properties"])
-    return schema
+    return flatten_wire_schema(InterviewTurn)
 
 
 @log_stage
